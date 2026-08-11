@@ -954,28 +954,27 @@ public sealed class ManagerForm : Form
     async Task RenameSelectedProfileAsync()
     {
         var selected = SelectedContext();
-        if (selected is null) throw new InvalidOperationException("Chưa chọn profile.");
+        if (selected is null)
+        {
+            ShowRenameFailure("Chưa chọn profile.");
+            return;
+        }
         var oldName = selected.Profile.Name;
         var newName = PromptText("Đổi tên profile", "Tên mới", oldName);
         if (string.IsNullOrWhiteSpace(newName)) return;
 
+        try { ResolveAndPersistRenamePathState(selected); }
+        catch (Exception ex) { ShowRenameFailure(ex.Message); return; }
+
         var validationCatalog = _profileService.Load();
-        var normalizedName = ValidateRenameProfileName(newName, selected.Profile, validationCatalog);
+        string normalizedName;
+        try { normalizedName = ValidateRenameProfileName(newName, selected.Profile, validationCatalog); }
+        catch (Exception ex) { ShowRenameFailure(ex.Message); return; }
         if (normalizedName.Equals(oldName, StringComparison.Ordinal)) return;
-        foreach (var alias in validationCatalog.Profiles.Where(p => !p.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase)
-            && _profileService.SharesStorageIdentity(p, selected.Profile)))
-        {
-            if (_contexts.TryGetValue(alias.Name, out var aliasContext)
-                && !ReferenceEquals(aliasContext, selected)
-                && (aliasContext.Tab is not null || (aliasContext.Worker is not null && !aliasContext.Worker.HasExited)))
-                throw new InvalidOperationException("Có profile entry trùng ProfilePath/DataRoot đang có tab/Worker mở. Hãy đóng tab đó trước khi gộp entry trùng.");
-        }
         if (_contexts.TryGetValue(normalizedName, out var nameOwner) && !ReferenceEquals(nameOwner, selected))
         {
-            if (!_profileService.SharesStorageIdentity(nameOwner.Profile, selected.Profile))
-                throw new InvalidOperationException("Profile đã tồn tại: " + normalizedName);
-            if (nameOwner.Tab is not null || (nameOwner.Worker is not null && !nameOwner.Worker.HasExited))
-                throw new InvalidOperationException("Profile trùng đường dẫn đang có tab/Worker mở. Hãy đóng tab đó trước khi gộp entry trùng.");
+            ShowRenameFailure("Profile đã tồn tại: " + normalizedName);
+            return;
         }
 
         _profileRenameInProgress = true;
@@ -983,79 +982,279 @@ public sealed class ManagerForm : Form
         Enabled = false;
 
         ChromeNameSyncRuntimeState? runtime = null;
-        var renameCommitted = false;
-        TikTokProfileEntry? renamed = null;
-        List<TikTokProfileEntry>? collapsedAliases = null;
+        var workerWasRunning = selected.Worker is not null && !selected.Worker.HasExited;
+        var workerStoppedForRename = false;
+        var saveAttempted = false;
+        TikTokProfileCatalog? previousPersistedCatalog = null;
+        TikTokProfileCatalog? verifiedCatalog = null;
+        TikTokProfileEntry? verifiedRename = null;
         try
         {
-            // Stop the exact old worker and Chrome before changing the catalog
-            // identity.  No storage directory is moved for a display rename.
+            // A display rename never moves ProfilePath or DataRoot.
             runtime = await CloseChromeForNameSyncAsync(selected, selected.Profile.ProfilePath);
             await ShutdownWorkerForProfileRenameAsync(selected);
+            workerStoppedForRename = workerWasRunning;
 
-            var catalog = _profileService.Load();
-            var current = catalog.Profiles.SingleOrDefault(p => p.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
-            if (current is null || !_profileService.SharesStorageIdentity(current, selected.Profile))
-                throw new InvalidOperationException("Profile đang đổi tên không còn khớp ProfilePath/DataRoot đã chọn. Không thực hiện thay đổi.");
+            // Use the raw persisted file as the transaction source. Discovery
+            // must not run between a successful save and UI/context update.
+            var catalog = _profileService.LoadPersistedCatalog();
+            previousPersistedCatalog = _profileService.LoadPersistedCatalog();
+
+            // Name is the catalog identity the user selected.  The old code
+            // tried to rediscover the entry by ProfilePath + DataRoot after
+            // stopping the Worker.  A stale/in-memory DataRoot was enough to
+            // make that comparison fail even though profiles.json still had
+            // exactly one valid entry named oldName.  Resolve the transaction
+            // source by its unique persisted old name, then preserve storage
+            // fields from that persisted entry verbatim.
+            var currentIndexes = catalog.Profiles
+                .Select((profile, index) => (profile, index))
+                .Where(item => item.profile.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (currentIndexes.Count != 1)
+                throw new InvalidOperationException($"Không tìm thấy đúng một entry catalog tên “{oldName}” để đổi tên (count={currentIndexes.Count}).");
+
+            var currentIndex = currentIndexes[0].index;
+            var current = currentIndexes[0].profile;
+            _log.Info($"[PROFILE_RENAME_SOURCE] oldName={oldName} profilePath={current.ProfilePath} dataRoot={current.DataRoot} cdpPort={current.CdpPort}");
 
             normalizedName = ValidateRenameProfileName(normalizedName, current, catalog);
-            renamed = _profileService.RenameProfile(current, normalizedName);
-            collapsedAliases = catalog.Profiles
-                .Where(p => !p.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase) && _profileService.SharesStorageIdentity(p, current))
-                .ToList();
+            var renamed = _profileService.RenameProfile(current, normalizedName);
 
-            // Remove only catalog aliases of the exact same storage identity.
-            // This never deletes a Chrome directory or runtime data directory.
-            catalog.Profiles.RemoveAll(p => p.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase)
-                || _profileService.SharesStorageIdentity(p, current));
-            catalog.Profiles.Add(renamed);
+            // Replace exactly the selected persisted entry in-place.  Do not
+            // remove by storage identity: aliases/legacy entries must never be
+            // deleted as a side effect of a display-name rename.
+            catalog.Profiles[currentIndex] = renamed;
             catalog.SelectedProfile = renamed.Name;
-            _profileService.EnsurePorts(catalog.Profiles);
-            _profileService.SaveWithBackup(catalog);
-            renameCommitted = true;
-
-            ApplyCommittedProfileRename(selected, oldName, renamed, collapsedAliases);
-            ReloadCatalog();
-            _chromeProfileNameSync.SyncBeforeLaunch(renamed.ProfilePath, renamed.Name);
-            if (collapsedAliases.Count > 0)
-                _log.Warn($"[PROFILE_RENAME_DEDUP] renamed={oldName}->{renamed.Name}; removed catalog aliases={string.Join(", ", collapsedAliases.Select(p => p.Name))}; no profile data deleted.");
-            _log.Info($"[PROFILE_RENAMED] oldName={oldName} newName={renamed.Name} profilePath={renamed.ProfilePath} dataRoot={renamed.DataRoot} cdpPort={renamed.CdpPort}");
+            saveAttempted = true;
+            _profileService.SaveWithBackupPreservingPorts(catalog);
+            var persisted = VerifyPersistedRename(oldName, renamed, current);
+            verifiedCatalog = persisted.Catalog;
+            verifiedRename = persisted.Entry;
         }
-        catch
+        catch (Exception ex)
         {
-            if (!renameCommitted && runtime?.ChromeWasOpen == true)
-            {
-                try { await ReopenChromeAfterNameSyncAsync(selected, runtime.AutomationWasRunning); }
-                catch (Exception reopenEx) { _log.Error($"[PROFILE_RENAME_ROLLBACK] cannot reopen old profile={oldName}: {reopenEx}"); }
-            }
-            throw;
+            var rollbackError = saveAttempted && previousPersistedCatalog is not null
+                ? TryRestoreCatalogAfterFailedRename(previousPersistedCatalog)
+                : null;
+            var runtimeError = await TryRestoreProfileRuntimeAfterRenameAsync(selected, workerStoppedForRename, runtime);
+            var detail = ex.Message;
+            if (!string.IsNullOrWhiteSpace(rollbackError)) detail += "\nKhôi phục profiles.json không thành công: " + rollbackError;
+            if (!string.IsNullOrWhiteSpace(runtimeError)) detail += "\nKhông thể khôi phục Worker/Chrome cũ: " + runtimeError;
+            _log.Error($"[PROFILE_RENAME_FAILED] oldName={oldName} newName={normalizedName} {detail}");
+            ShowRenameFailure(detail);
+            return;
         }
         finally
         {
-            if (renameCommitted && runtime?.ChromeWasOpen == true)
+            if (verifiedRename is null)
             {
-                try { await ReopenChromeAfterNameSyncAsync(selected, runtime.AutomationWasRunning); }
-                catch (Exception reopenEx) { _log.Error($"[PROFILE_RENAME_REOPEN] profile={selected.Profile.Name}: {reopenEx}"); }
+                _profileRenameInProgress = false;
+                if (!IsDisposed) Enabled = previousEnabled;
             }
+        }
+
+        try
+        {
+            // The existing ProfileContext, tab, worker host and settings UI
+            // move together only after persistence is proven.  This is not a
+            // new profile/open operation; the same context is re-keyed.
+            ApplyCommittedProfileRename(selected, oldName, verifiedRename!);
+            RefreshContextsFromCatalog(verifiedCatalog!);
+
+            string? syncError = null;
+            try { _chromeProfileNameSync.SyncBeforeLaunch(verifiedRename!.ProfilePath, verifiedRename.Name); }
+            catch (Exception ex)
+            {
+                syncError = ex.Message;
+                _log.Error($"[PROFILE_RENAME_CHROME_NAME_SYNC_FAILED] profile={verifiedRename!.Name} {ex}");
+            }
+            var reopenError = await TryRestoreProfileRuntimeAfterRenameAsync(selected, workerStoppedForRename, runtime);
+            if (!string.IsNullOrWhiteSpace(reopenError))
+                _log.Error($"[PROFILE_RENAME_RESTORE_FAILED] profile={verifiedRename!.Name} {reopenError}");
+            _log.Info($"[PROFILE_RENAMED] oldName={oldName} newName={verifiedRename!.Name} profilePath={verifiedRename.ProfilePath} dataRoot={verifiedRename.DataRoot} cdpPort={verifiedRename.CdpPort}");
+
+            var success = $"Đã đổi tên {oldName} → {verifiedRename.Name}";
+            if (!string.IsNullOrWhiteSpace(syncError)) success += "\n\nTên Chrome chưa đồng bộ: " + syncError;
+            if (!string.IsNullOrWhiteSpace(reopenError)) success += "\n\nWorker/Chrome chưa khôi phục: " + reopenError;
+            MessageBox.Show(this, success, "Đổi tên profile", MessageBoxButtons.OK,
+                string.IsNullOrWhiteSpace(syncError) && string.IsNullOrWhiteSpace(reopenError) ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        finally
+        {
             _profileRenameInProgress = false;
             if (!IsDisposed) Enabled = previousEnabled;
         }
     }
 
+    void ResolveAndPersistRenamePathState(ProfileContext context)
+    {
+        var contextProfile = context.Profile;
+        var profileName = _profileService.NormalizeName(contextProfile.Name);
+        var catalog = _profileService.LoadPersistedCatalog();
+        var matches = catalog.Profiles
+            .Where(profile => profile.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (matches.Count != 1)
+            throw new InvalidOperationException("Không tìm thấy đúng một entry catalog cho profile đang đổi tên.");
+
+        var stored = matches[0];
+        _log.Info($"[RENAME_PATH_STATE] name={profileName} profilePath={LogRenamePath(stored.ProfilePath)} dataRoot={LogRenamePath(stored.DataRoot)} contextProfilePath={LogRenamePath(contextProfile.ProfilePath)} contextDataRoot={LogRenamePath(contextProfile.DataRoot)}");
+
+        var (profilePath, profilePathSource) = ResolveRenameProfilePath(profileName, stored.ProfilePath, contextProfile.ProfilePath);
+        var (dataRoot, dataRootSource) = ResolveRenameDataRoot(profileName, stored.DataRoot, contextProfile.DataRoot);
+        var resolved = new TikTokProfileEntry
+        {
+            Name = stored.Name,
+            ProfilePath = profilePath,
+            DataRoot = dataRoot,
+            CdpPort = stored.CdpPort,
+            Enabled = stored.Enabled,
+            Managed = stored.Managed
+        };
+
+        // Persist even when only normalization was needed.  This creates the
+        // durable legacy-path checkpoint before the rename transaction starts.
+        catalog.Profiles[catalog.Profiles.IndexOf(stored)] = resolved;
+        _profileService.SaveWithBackupPreservingPorts(catalog);
+
+        var persisted = _profileService.LoadPersistedCatalog();
+        var verifiedMatches = persisted.Profiles
+            .Where(profile => profile.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (verifiedMatches.Count != 1)
+            throw new InvalidOperationException("Không thể xác minh lại entry catalog sau khi bổ sung đường dẫn.");
+        var verified = verifiedMatches[0];
+        var verifiedProfilePath = TikTokProfileService.RequireCanonicalPath(verified.ProfilePath, "ProfilePath");
+        var verifiedDataRoot = _profileService.ResolveDataRoot(verified);
+        if (!SameCanonicalPath(verifiedProfilePath, profilePath) || !SameCanonicalPath(verifiedDataRoot, dataRoot))
+            throw new InvalidOperationException("Không thể xác minh ProfilePath/DataRoot sau khi bổ sung đường dẫn.");
+
+        context.Profile = new TikTokProfileEntry
+        {
+            Name = verified.Name,
+            ProfilePath = verifiedProfilePath,
+            DataRoot = verifiedDataRoot,
+            CdpPort = verified.CdpPort,
+            Enabled = verified.Enabled,
+            Managed = verified.Managed
+        };
+        _log.Info($"[RENAME_PATH_BACKFILL] name={profileName} profilePath={verifiedProfilePath} dataRoot={verifiedDataRoot} profilePathSource={profilePathSource} dataRootSource={dataRootSource} persisted=true");
+    }
+
+    (string Path, string Source) ResolveRenameProfilePath(string profileName, string? storedPath, string? contextPath)
+    {
+        foreach (var candidate in new[] { (Value: storedPath, Source: "catalog"), (Value: contextPath, Source: "context") })
+        {
+            if (string.IsNullOrWhiteSpace(candidate.Value)) continue;
+            var fullPath = TikTokProfileService.RequireCanonicalPath(candidate.Value, "ProfilePath");
+            if (Directory.Exists(fullPath)) return (fullPath, candidate.Source);
+        }
+
+        // Managed legacy profiles have historically used this exact existing
+        // directory layout.  It is a lookup only: no directory is created.
+        var managedPath = _profileService.GetProfilePath(profileName);
+        if (Directory.Exists(managedPath))
+            return (TikTokProfileService.RequireCanonicalPath(managedPath, "ProfilePath"), "managed-legacy");
+
+        if (profileName.Equals(TikTokProfileService.LegacyImportedProfileName, StringComparison.OrdinalIgnoreCase)
+            && Directory.Exists(TikTokProfileService.LegacyImportedProfilePath))
+            return (TikTokProfileService.RequireCanonicalPath(TikTokProfileService.LegacyImportedProfilePath, "ProfilePath"), "v11-legacy");
+
+        var suppliedButMissing = FirstNonEmpty(storedPath, contextPath);
+        if (!string.IsNullOrWhiteSpace(suppliedButMissing))
+            throw new InvalidOperationException("ProfilePath không tồn tại: " + suppliedButMissing.Trim());
+        throw new InvalidOperationException("ProfilePath đang thiếu. Không tìm thấy thư mục Chrome profile thực tế để bổ sung.");
+    }
+
+    (string Path, string Source) ResolveRenameDataRoot(string profileName, string? storedPath, string? contextPath)
+    {
+        var existing = FirstNonEmpty(storedPath, contextPath);
+        if (!string.IsNullOrWhiteSpace(existing))
+            return (TikTokProfileService.RequireCanonicalPath(existing, "DataRoot"), string.IsNullOrWhiteSpace(storedPath) ? "context" : "catalog");
+
+        // ResolveDataRoot's legacy compatibility rule is profiles/<old name>.
+        // It only records the location and deliberately does not create it.
+        var compatibilityEntry = new TikTokProfileEntry { Name = profileName, DataRoot = "" };
+        return (_profileService.ResolveDataRoot(compatibilityEntry), "compatibility-default");
+    }
+
+    static string? FirstNonEmpty(params string?[] values)
+        => values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+    static string LogRenamePath(string? path) => string.IsNullOrWhiteSpace(path) ? "<empty>" : path.Trim();
+
     string ValidateRenameProfileName(string rawName, TikTokProfileEntry currentProfile, TikTokProfileCatalog catalog)
     {
         var normalized = _profileService.NormalizeName(rawName);
-        if (catalog.Profiles.Any(p => !p.Name.Equals(currentProfile.Name, StringComparison.OrdinalIgnoreCase)
-            && p.Name.Equals(normalized, StringComparison.OrdinalIgnoreCase)
-            && !_profileService.SharesStorageIdentity(p, currentProfile)))
+        if (catalog.Profiles.Any(profile => !profile.Name.Equals(currentProfile.Name, StringComparison.OrdinalIgnoreCase)
+            && profile.Name.Equals(normalized, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException("Profile đã tồn tại: " + normalized);
         return normalized;
     }
 
-    void ApplyCommittedProfileRename(ProfileContext context, string oldName, TikTokProfileEntry renamed, IEnumerable<TikTokProfileEntry> collapsedAliases)
+    (TikTokProfileCatalog Catalog, TikTokProfileEntry Entry) VerifyPersistedRename(string oldName, TikTokProfileEntry expectedRename, TikTokProfileEntry original)
     {
-        foreach (var alias in collapsedAliases)
-            _contexts.Remove(alias.Name);
+        var persisted = _profileService.LoadPersistedCatalog();
+        var renamedEntries = persisted.Profiles
+            .Where(profile => profile.Name.Equals(expectedRename.Name, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (renamedEntries.Count != 1)
+            throw new InvalidOperationException($"profiles.json không chứa đúng một profile mới “{expectedRename.Name}”.");
+        if (persisted.Profiles.Any(profile => profile.Name.Equals(oldName, StringComparison.Ordinal)))
+            throw new InvalidOperationException($"profiles.json vẫn còn tên cũ “{oldName}”.");
+
+        var renamed = renamedEntries[0];
+        if (!HasExactStorageIdentity(renamed, original)
+            || renamed.CdpPort != original.CdpPort
+            || renamed.Managed != original.Managed
+            || renamed.Enabled != original.Enabled)
+            throw new InvalidOperationException("profiles.json sau khi lưu đã thay đổi ProfilePath, DataRoot hoặc cấu hình của profile. Đã hủy đổi tên.");
+        return (persisted, renamed);
+    }
+
+    string? TryRestoreCatalogAfterFailedRename(TikTokProfileCatalog previousCatalog)
+    {
+        try
+        {
+            _profileService.Save(previousCatalog);
+            _profileService.BackupCatalogIfExists();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _log.Error("[PROFILE_RENAME_ROLLBACK_CATALOG] " + ex);
+            return ex.Message;
+        }
+    }
+
+    bool HasExactStorageIdentity(TikTokProfileEntry left, TikTokProfileEntry right)
+        => SameCanonicalPath(left.ProfilePath, right.ProfilePath)
+            && SameCanonicalPath(_profileService.ResolveDataRoot(left), _profileService.ResolveDataRoot(right));
+
+    static bool SameCanonicalPath(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            var canonicalLeft = Path.GetFullPath(left.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var canonicalRight = Path.GetFullPath(right.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return canonicalLeft.Equals(canonicalRight, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
+        catch (NotSupportedException) { return false; }
+    }
+
+    void ShowRenameFailure(string reason)
+        => MessageBox.Show(this, "Không thể đổi tên: " + reason, "Đổi tên profile", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+    void ApplyCommittedProfileRename(ProfileContext context, string oldName, TikTokProfileEntry renamed)
+    {
+        // Contexts used display names as dictionary keys.  Remove each key
+        // that points to this exact context, then reinsert it under the
+        // verified new name without replacing its tab/host/Worker objects.
+        foreach (var key in _contexts.Where(pair => ReferenceEquals(pair.Value, context)).Select(pair => pair.Key).ToList())
+            _contexts.Remove(key);
         _contexts.Remove(oldName);
         context.Profile = renamed;
         _contexts[renamed.Name] = context;
@@ -1370,6 +1569,36 @@ public sealed class ManagerForm : Form
         await SendCommandAsync(context, "launch", TimeSpan.FromSeconds(25));
         if (restartAutomation)
             await SendCommandAsync(context, "start", TimeSpan.FromSeconds(30));
+    }
+
+    async Task<string?> TryRestoreProfileRuntimeAfterRenameAsync(ProfileContext context, bool restoreWorker, ChromeNameSyncRuntimeState? runtime)
+    {
+        if (!restoreWorker && runtime?.ChromeWasOpen != true) return null;
+        try
+        {
+            // Do not use the generic OpenProfileAsync here: rename deliberately
+            // blocks normal opens.  Recreate and embed the same ProfileContext
+            // so an already-open tab never turns into a blank/new profile.
+            await EnsureWorkerAsync(context);
+            await RefreshStatusAsync(context);
+            if (context.Host is not null)
+                await EmbedWorkerAsync(context);
+
+            if (runtime?.ChromeWasOpen == true)
+            {
+                var result = await SendCommandAsync(context, "launch", TimeSpan.FromSeconds(25));
+                if (!result.Equals("opened", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Worker không mở lại Chrome: " + result);
+                if (runtime.AutomationWasRunning)
+                    await SendCommandAsync(context, "start", TimeSpan.FromSeconds(30));
+            }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            SetStatus(context, "Không thể khôi phục Worker/Chrome: " + ex.Message, Color.Firebrick);
+            return ex.Message;
+        }
     }
 
     async Task ShutdownWorkerForProfileRenameAsync(ProfileContext context)

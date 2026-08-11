@@ -18,7 +18,7 @@ public sealed class ChromeProfileNameSyncService
     public SyncResult SyncBeforeLaunch(string userDataDir, string profileName, string? profileDirectory = null)
     {
         if (string.IsNullOrWhiteSpace(userDataDir))
-            throw new ArgumentException("Chrome user-data-dir is required.", nameof(userDataDir));
+            throw new InvalidOperationException("ProfilePath đang thiếu.");
         if (string.IsNullOrWhiteSpace(profileName))
             throw new ArgumentException("Profile name is required.", nameof(profileName));
 
@@ -57,6 +57,8 @@ public sealed class ChromeProfileNameSyncService
 
     static (string profilePath, string profileKey) ResolveProfileDirectory(string userDataDir, string? profileDirectory)
     {
+        if (string.IsNullOrWhiteSpace(userDataDir))
+            throw new InvalidOperationException("ProfilePath đang thiếu.");
         var root = Path.GetFullPath(userDataDir);
         var directory = string.IsNullOrWhiteSpace(profileDirectory)
             ? (File.Exists(Path.Combine(root, "Preferences")) ? root : Path.Combine(root, "Default"))
@@ -108,7 +110,7 @@ public sealed class ChromeProfileNameSyncService
 
     public static bool IsProfileInUse(string userDataDir)
     {
-        var target = Path.GetFullPath(userDataDir).TrimEnd(Path.DirectorySeparatorChar);
+        if (!TryGetCanonicalUserDataDir(userDataDir, out var target)) return false;
         return FindChromeProcessesUsingProfile(target).Count > 0;
     }
 
@@ -119,6 +121,7 @@ public sealed class ChromeProfileNameSyncService
     /// </summary>
     public static IReadOnlyList<int> StopChromeUsingProfile(string userDataDir)
     {
+        if (!TryGetCanonicalUserDataDir(userDataDir, out _)) return [];
         var stopped = new List<int>();
         foreach (var item in FindChromeProcessesUsingProfile(userDataDir))
         {
@@ -138,7 +141,7 @@ public sealed class ChromeProfileNameSyncService
 
     static List<ChromeProcessInfo> FindChromeProcessesUsingProfile(string userDataDir)
     {
-        var target = Path.GetFullPath(userDataDir).TrimEnd(Path.DirectorySeparatorChar);
+        if (!TryGetCanonicalUserDataDir(userDataDir, out var target)) return [];
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo("powershell.exe",
@@ -177,6 +180,19 @@ public sealed class ChromeProfileNameSyncService
             return result;
         }
         catch { return []; }
+    }
+
+    static bool TryGetCanonicalUserDataDir(string? userDataDir, out string target)
+    {
+        target = "";
+        if (string.IsNullOrWhiteSpace(userDataDir)) return false;
+        try
+        {
+            target = Path.GetFullPath(userDataDir.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (NotSupportedException) { return false; }
     }
 
     static bool ProfileArgumentMatches(string commandLine, string target)

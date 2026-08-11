@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using ToolTikTokV12.Models;
@@ -31,7 +31,20 @@ public sealed class TikTokProfileService
     public string ResolveDataRoot(TikTokProfileEntry entry)
         => string.IsNullOrWhiteSpace(entry.DataRoot)
             ? GetDefaultDataRoot(entry.Name)
-            : Path.GetFullPath(entry.DataRoot.Trim());
+            : RequireCanonicalPath(entry.DataRoot, "DataRoot");
+
+    /// <summary>
+    /// Normalizes a path only after making an empty legacy value explicit.
+    /// This keeps callers from leaking ArgumentOutOfRangeException from
+    /// Path.GetFullPath when a catalog written by an older version omitted a
+    /// path field.
+    /// </summary>
+    public static string RequireCanonicalPath(string? path, string fieldName)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException(fieldName + " đang thiếu.");
+        return Path.GetFullPath(path.Trim());
+    }
 
     public TikTokProfileCatalog Load()
     {
@@ -89,7 +102,16 @@ public sealed class TikTokProfileService
 
         try
         {
-            var catalog = JsonSerializer.Deserialize<TikTokProfileCatalog>(json);
+            // profiles.json is intentionally written with lower-case entry
+            // fields (name/profilePath/dataRoot/cdpPort/...).  The CLR model
+            // uses PascalCase properties.  Default System.Text.Json matching
+            // is case-sensitive, which can return a catalog with the right
+            // number of Profiles but every entry left with empty/default
+            // fields.  That made Rename report that the selected persisted
+            // entry did not exist.  Read catalog files case-insensitively so
+            // both current and legacy casing round-trip correctly.
+            var catalog = JsonSerializer.Deserialize<TikTokProfileCatalog>(json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             if (catalog is not null && catalog.Profiles.Count > 0) return catalog;
         }
         catch { }
@@ -317,7 +339,7 @@ public sealed class TikTokProfileService
     public TikTokProfileEntry ImportExistingProfile(string displayName, string profilePath)
     {
         var name = NormalizeName(displayName);
-        var fullPath = Path.GetFullPath((profilePath ?? "").Trim());
+        var fullPath = RequireCanonicalPath(profilePath, "ProfilePath");
         ValidateChromeProfilePath(fullPath);
         return new TikTokProfileEntry
         {
@@ -339,7 +361,7 @@ public sealed class TikTokProfileService
         return new TikTokProfileEntry
         {
             Name = to,
-            ProfilePath = Path.GetFullPath(entry.ProfilePath),
+            ProfilePath = RequireCanonicalPath(entry.ProfilePath, "ProfilePath"),
             DataRoot = ResolveDataRoot(entry),
             Managed = entry.Managed,
             Enabled = entry.Enabled,
@@ -364,7 +386,7 @@ public sealed class TikTokProfileService
 
     public void ValidateChromeProfilePath(string profilePath)
     {
-        var fullPath = Path.GetFullPath((profilePath ?? "").Trim());
+        var fullPath = RequireCanonicalPath(profilePath, "ProfilePath");
         if (!Directory.Exists(fullPath)) throw new DirectoryNotFoundException("Không tìm thấy thư mục profile: " + fullPath);
 
         var defaultDir = Path.Combine(fullPath, "Default");
@@ -389,7 +411,7 @@ public sealed class TikTokProfileService
         => new()
         {
             Name = NormalizeName(entry.Name),
-            ProfilePath = Path.GetFullPath(entry.ProfilePath.Trim()),
+            ProfilePath = RequireCanonicalPath(entry.ProfilePath, "ProfilePath"),
             DataRoot = ResolveDataRoot(entry),
             CdpPort = entry.CdpPort,
             Enabled = entry.Enabled,
@@ -446,11 +468,29 @@ public sealed class TikTokProfileService
     }
 
     public bool SharesStorageIdentity(TikTokProfileEntry left, TikTokProfileEntry right)
-        => CanonicalPath(left.ProfilePath).Equals(CanonicalPath(right.ProfilePath), StringComparison.OrdinalIgnoreCase)
-            || CanonicalPath(ResolveDataRoot(left)).Equals(CanonicalPath(ResolveDataRoot(right)), StringComparison.OrdinalIgnoreCase);
+    {
+        if (!TryCanonicalPath(left.ProfilePath, out var leftProfilePath)
+            || !TryCanonicalPath(right.ProfilePath, out var rightProfilePath))
+            return false;
 
-    static string CanonicalPath(string path)
-        => Path.GetFullPath(path.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (leftProfilePath.Equals(rightProfilePath, StringComparison.OrdinalIgnoreCase)) return true;
+        return TryCanonicalPath(ResolveDataRoot(left), out var leftDataRoot)
+            && TryCanonicalPath(ResolveDataRoot(right), out var rightDataRoot)
+            && leftDataRoot.Equals(rightDataRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool TryCanonicalPath(string? path, out string canonicalPath)
+    {
+        canonicalPath = "";
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            canonicalPath = Path.GetFullPath(path.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (NotSupportedException) { return false; }
+    }
 
     List<TikTokProfileEntry> DiscoverManagedProfiles()
     {
