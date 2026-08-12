@@ -1,0 +1,57 @@
+name: Package Windows Portable
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish worker self-contained
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\portable" | Out-Null
+          dotnet publish ".\ToolTikTokWorkerV125\ToolTikTokWorkerV125.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o "$env:GITHUB_WORKSPACE\portable"
+
+      - name: Publish manager self-contained
+        shell: pwsh
+        run: |
+          dotnet publish ".\ToolTikTokManagerV125\ToolTikTokManagerV125.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o "$env:GITHUB_WORKSPACE\portable"
+
+      - name: Add instructions
+        shell: pwsh
+        run: |
+          @'
+          TOOL TIKTOK V12.5 - BAN MAY KHACH
+
+          1. Giai nen toan bo file ZIP.
+          2. Dam bao Google Chrome da duoc cai tren Windows.
+          3. Chay ToolTikTokManagerV125.exe.
+          4. Khong can Visual Studio, .NET SDK hay dotnet run.
+          5. Khong tach rieng cac DLL/EXE khoi thu muc.
+
+          Day la ban Windows x64 self-contained dong goi tu source V12.5 hien tai.
+          '@ | Set-Content -Path "$env:GITHUB_WORKSPACE\portable\HUONG_DAN_SU_DUNG.txt" -Encoding UTF8
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\portable\*" -DestinationPath "$env:GITHUB_WORKSPACE\Tool_TikTok_V12.5_PORTABLE_WIN_X64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tool_TikTok_V12.5_PORTABLE_WIN_X64
+          path: Tool_TikTok_V12.5_PORTABLE_WIN_X64.zip
+          if-no-files-found: error
+          retention-days: 7
