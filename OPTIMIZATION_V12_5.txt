@@ -1,0 +1,72 @@
+TOOL TIKTOK V12.5 - PERFORMANCE OPTIMIZATION PASS
+=================================================
+
+Muc tieu:
+- Tang do phan hoi Manager/Worker va giam I/O/CPU thua.
+- Khong thay doi thu tu automation, delay nghiep vu, XPath, OCR parsing,
+  image-matching thresholds/scales, Rename/Discovery/storage identity.
+
+Da toi uu:
+1. Worker + Manager logger:
+   - Giu mot append stream thay vi mo/dong file moi dong log.
+   - Flush theo batch 200 ms; ERROR flush ngay.
+   - Giu nguyen noi dung/thu tu log va cleanup log 24h.
+
+2. Worker UI log:
+   - Gom log 100 ms va AppendText theo batch, tranh BeginInvoke/redraw cho moi dong PERF.
+
+3. Manager <-> Worker status IPC:
+   - Status gui truc tiep, khong ping truoc tren worker dang khoe.
+   - Neu status loi moi chay health/restart path va retry status 1 lan.
+   - Cac command co side effect van giu flow ping/ensure cu.
+
+4. Worker status snapshot:
+   - Status khong can marshal sang UI thread chi de doc label/handle.
+
+5. Image scan:
+   - Mot scan pass van dung dung mot viewport screenshot nhu cu.
+   - PNG screenshot chi decode thanh Bitmap mot lan trong scan pass, cac region crop lai tu Bitmap do.
+   - Khong thay doi matcher, variation, scale, timeout, thu tu region/template/STOP.
+
+6. Chrome profile owner check:
+   - Khi cho profile release, chi query PowerShell/CIM mot lan, sau do poll PID da xac minh.
+   - Launch van query owner lan cuoi truoc khi mo Chrome.
+   - PowerShell wait tren hot path chuyen sang async de Worker UI khong bi block.
+
+7. Close Worker/Manager:
+   - WaitForExit(7000) dong bo -> WaitForExitAsync voi cung timeout 7 giay.
+
+8. Live cu diagnostics UI:
+   - Khong Rows.Clear/Add lai toan bo DataGridView moi giay neu entry list khong doi.
+   - Chi update Age/Remaining cell khi can.
+
+9. JSON allocations:
+   - Tai su dung JsonSerializerOptions cho catalog va worker snapshot.
+   - Bo mot EnsurePorts trung lap trong ReloadCatalog; SaveWithBackup van validate ports nhu cu.
+
+10. Tesseract:
+   - Cache duong dan tesseract.exe sau khi tim thay thanh cong.
+   - Neu chua tim thay, lan sau van quet lai nhu hanh vi cu.
+
+Co y KHONG doi:
+- ScanInterval/EnterReaction/F5/ArrowDown delays.
+- Thu tu 8 buoc automation.
+- ImageMatcher algorithm, 7 scales, Variation, STOP confirm.
+- Viewer threshold/confirm/retry logic va parser OCR.
+- XPath/CDP action/recovery logic.
+- Rename/Discovery, ProfilePath, DataRoot, CdpPort, profiles.json identity.
+- Legacy migration semantics (khong them marker one-time de tranh bo sot data V12 moi).
+
+BUILD/TEST:
+- Moi truong tao goi nay khong co .NET SDK/WindowsDesktop targeting pack, nen khong the
+  build WinForms net8.0-windows tai day.
+- Tren may Windows cua ban, chay BUILD_V12_5.bat de build kiem tra.
+- Sau build, test: mo 5-10 profile, status 1s, mo/dong Chrome, scan anh, OCR, Live cu,
+  stop/close Manager va kiem tra log/runtime nhu truoc.
+
+=== OPTIMIZED V2 (2026-08-12) ===
+- Full-scan thường chuyển sang ngay trước Click bước 1/5; không full-scan sau Enter.
+- Bỏ fast-scan AfterClick khỏi workflow chính; giữ wait phản hồi Enter 2000 ms.
+- Vùng quét ảnh có + Thêm dòng / Xóa dòng; bỏ cột nút Test/Xem/Xóa lặp.
+- Không capture/crop vùng không có ảnh mẫu.
+- Cache viewport size trong cùng scan pass; box XPath vẫn đọc riêng từng vùng.

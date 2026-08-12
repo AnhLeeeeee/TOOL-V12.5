@@ -1,0 +1,44 @@
+TOOL TIKTOK V12.5 - OPTIMIZED V2
+================================
+
+1) THAY ĐỔI THỜI ĐIỂM QUÉT ẢNH THƯỜNG
+- Bỏ full-scan sau Enter ở bước 3 và bước 7.
+- Bỏ fast-scan sau Click của workflow chính.
+- Full-scan vùng không định kỳ chạy ngay trước Click ở bước 1 và bước 5.
+- Giữ nguyên khoảng chờ 2000 ms sau Enter để TikTok có thời gian phản hồi.
+- Quét định kỳ/STOP định kỳ, Viewer, Live cũ, F5 định kỳ và transition/recovery giữ nguyên.
+
+Flow mới:
+Quét -> Click 1 -> Dán 1 -> Enter 1 -> chờ phản hồi -> chuyển điểm
+-> Quét -> Click 2 -> Dán 2 -> Enter 2 -> chờ phản hồi -> kết thúc vòng.
+
+2) GIAO DIỆN VÙNG QUÉT ẢNH
+- Thêm nút: + Thêm dòng.
+- Thêm nút: Xóa dòng.
+- Xóa dòng chỉ xóa cấu hình dòng, KHÔNG xóa file ảnh mẫu trên ổ đĩa.
+- Đưa Xem ảnh mẫu / Xóa ảnh mẫu lên thanh công cụ.
+- Bỏ các cột nút lặp trên từng dòng: Test, Xem, Xóa ảnh.
+- Ẩn cột Sau click vì runtime mới không còn dùng scan sau click.
+- Giữ các cột cần thiết: Bật, Tên vùng, Định kỳ, Chu kỳ, Hành động,
+  Sai số, Lỗi LT, XP quét, XP bấm, Ảnh mẫu.
+- Dữ liệu AfterClick cũ vẫn được giữ ẩn để không phá cấu hình cũ.
+
+3) TỐI ƯU AN TOÀN BỔ SUNG
+- Vùng không có ảnh mẫu được bỏ qua trước khi chụp/crop screenshot, tránh CDP/ảnh thừa.
+- Trong cùng một scan pass, kích thước viewport được đọc một lần và tái sử dụng.
+- Vẫn đọc box XPath riêng cho từng vùng để không thay đổi semantics nếu DOM di chuyển.
+- Giữ tối ưu trước đó: screenshot decode một lần/pass, template cache, buffered logger,
+  IPC/status nhẹ hơn, async process wait, UI refresh giảm churn, cache Tesseract path.
+- Xóa dead runtime path của fast-scan AfterClick/AfterEnter và boundary scan dư trong engine.
+
+4) KHÔNG THAY ĐỔI
+- ImageMatcher / 7 scale / Variation.
+- Thứ tự ưu tiên STOP.
+- Action F5 / CLICK_F5 / STOP.
+- Logic chuyển LIVE, ArrowDown, F5/reload, xác minh LIVE mới.
+- Viewer/OCR, Live cũ, periodic, recovery.
+- ProfilePath/DataRoot/CdpPort, Rename/Discovery.
+- Dữ liệu profile/cookie/XPath/ảnh mẫu hiện có.
+
+5) BUILD
+Chạy BUILD_V12_5.bat trên Windows. Sau khi build OK, chạy RUN_V12_5_DEV.bat.

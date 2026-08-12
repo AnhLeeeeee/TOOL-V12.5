@@ -11,6 +11,8 @@ public sealed class TikTokProfileService
     public const string LegacyImportedProfilePath = @"D:\TOOL V2\Tool_TikTok_V11_XPath_CSharp\dist\chrome_v11_profile";
     public const string LegacyImportedProfileName = "TikTok cu";
     const int DefaultStartPort = 9222;
+    static readonly JsonSerializerOptions CatalogReadJson = new() { PropertyNameCaseInsensitive = true };
+    static readonly JsonSerializerOptions CatalogWriteJson = new() { WriteIndented = true };
 
     readonly string _catalogPath;
     readonly CdpPortAllocator _portAllocator = new();
@@ -110,8 +112,7 @@ public sealed class TikTokProfileService
             // fields.  That made Rename report that the selected persisted
             // entry did not exist.  Read catalog files case-insensitively so
             // both current and legacy casing round-trip correctly.
-            var catalog = JsonSerializer.Deserialize<TikTokProfileCatalog>(json,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            var catalog = JsonSerializer.Deserialize<TikTokProfileCatalog>(json, CatalogReadJson);
             if (catalog is not null && catalog.Profiles.Count > 0) return catalog;
         }
         catch { }
@@ -239,7 +240,7 @@ public sealed class TikTokProfileService
                 .ToList()
         };
 
-        var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        var json = JsonSerializer.Serialize(payload, CatalogWriteJson);
         var tempPath = _catalogPath + ".tmp";
         using (JsonDocument.Parse(json)) { }
         File.WriteAllText(tempPath, json);

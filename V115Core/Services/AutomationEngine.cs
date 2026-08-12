@@ -8,8 +8,9 @@ namespace ToolTikTokV11.Services;
 
 /// <summary>
 /// V11 chỉ thay lớp tương tác Chrome bằng XPath/CDP. State machine và thứ tự ưu tiên
-/// dưới đây bám theo V10.4.4: 8 bước gửi nội dung, quét nhanh, xử lý ảnh lặp sau F5,
-/// OCR người xem, F5 định kỳ, Live cũ T-10s, quét định kỳ ưu tiên và transition lock.
+/// dưới đây bám theo V10.4.4, với một thay đổi chủ đích ở V12.5: quét ảnh thường
+/// ngay trước mỗi bước Click (1 và 5) thay vì full-scan sau Enter. Các luồng OCR người xem,
+/// F5 định kỳ, Live cũ T-10s, quét định kỳ ưu tiên và transition lock giữ nguyên.
 /// </summary>
 public sealed class AutomationEngine
 {
@@ -27,10 +28,7 @@ public sealed class AutomationEngine
 
     const int ScanIntervalMs = 350; // Giảm một lượt screenshot thừa trong cửa sổ quan sát 1 giây.
     const int EnterReactionScanMs = 2000;
-    const int MinPostActionScanMs = 700;
-    const int RecentFullScanFreshMs = 750;
     const int VerifyAfterF5Ms = 1500;
-    const int BackupScanMs = 30000;
     // ArrowDown vẫn có 2 giây settle riêng. Sau Reload chỉ cần nhịp CDP ngắn
     // rồi xác nhận DOM ready, không cộng thêm một sleep cố định 2 giây.
     const int F5WaitMs = 1000;
@@ -86,7 +84,6 @@ public sealed class AutomationEngine
     System.Diagnostics.Stopwatch? _loopPerf;
     long _loopPerfTotalMs;
     long _loopPerfCount;
-    DateTime _lastFullNonPeriodicScanAt = DateTime.MinValue;
 
     DateTime _periodicDue = DateTime.MaxValue;
     DateTime _candidateCaptureAt = DateTime.MaxValue;
@@ -95,7 +92,6 @@ public sealed class AutomationEngine
     bool _legacyOldLiveFilesChecked;
     DateTime _nextOldLiveScan = DateTime.MaxValue;
     DateTime _nextViewer = DateTime.MaxValue;
-    DateTime _nextBackupScan = DateTime.MaxValue;
     DateTime _stopAt = DateTime.MaxValue;
     bool _periodicExecuting;
     PeriodicF5Snapshot _periodicSnapshot = new(false, false, false, DateTime.MaxValue);
@@ -117,6 +113,21 @@ public sealed class AutomationEngine
         public required ImageMatcher.MultiScaleTemplate Template { get; init; }
 
         public void Dispose() => Template.Dispose();
+    }
+
+    sealed class ScanCaptureCache : IDisposable
+    {
+        public byte[]? ViewportBytes { get; set; }
+        public Bitmap? ViewportBitmap { get; set; }
+        public (int width, int height)? ViewportSize { get; set; }
+
+        public void Dispose()
+        {
+            ViewportBitmap?.Dispose();
+            ViewportBitmap = null;
+            ViewportBytes = null;
+            ViewportSize = null;
+        }
     }
 
     sealed record PersistedOldLiveEntry(string Id, string FileName, DateTime CreatedAt, DateTime ExpiresAt, string Source);
@@ -202,7 +213,6 @@ public sealed class AutomationEngine
         _loopPerf = System.Diagnostics.Stopwatch.StartNew();
         _loopPerfTotalMs = 0;
         _loopPerfCount = 0;
-        _lastFullNonPeriodicScanAt = DateTime.MinValue;
         _paused = false;
         _running = true;
         _transitioning = false;
@@ -212,7 +222,6 @@ public sealed class AutomationEngine
         // Khi vừa bắt đầu tool, nếu bật kiểm tra người xem thì OCR ngay ở vòng đầu tiên
         // để có thể đi thẳng vào chuỗi ↓ + F5 hiện có trước khi gửi nội dung.
         _nextViewer = _s.Viewer.Enabled ? now : DateTime.MaxValue;
-        _nextBackupScan = now.AddMilliseconds(BackupScanMs);
         _stopAt = _s.TimerStopMinutes > 0 ? now.AddMinutes(_s.TimerStopMinutes) : DateTime.MaxValue;
         EnsureOldLivesReadyForRun();
         foreach (var r in _s.ScanRegions)
@@ -293,26 +302,9 @@ public sealed class AutomationEngine
                     if (await HandlePeriodicCaptureAndF5Async(ct)) continue;
                     if (await HandleViewerDueAsync(ct)) continue;
 
-                    // V10: quét ảnh thường trước mỗi bước. STOP luôn được xét trước.
-                    // Fast scan sau Enter vừa quét đúng cùng tập vùng; không quét lại
-                    // ngay ở ranh giới kế tiếp để tránh hai screenshot/match liên tiếp.
-                    if (!HasRecentFullNonPeriodicScan())
-                    {
-                        if (await ScanAndProcessAtBoundaryAsync(ScanMode.AllNonPeriodic, ct)) continue;
-                    }
-                    else
-                    {
-                        _log.Info("[SCAN_DEDUP] source=boundary reason=recent-full-post-enter-scan");
-                    }
-
-                    // Lượt boundary phía trên vừa quét toàn bộ vùng.  Backup chỉ là
-                    // lịch nhắc; không chạy lặp cùng một scan trong cùng ranh giới.
-                    if (DateTime.Now >= _nextBackupScan)
-                    {
-                        _nextBackupScan = DateTime.Now.AddMilliseconds(BackupScanMs);
-                        _log.Info("[SCAN_DEDUP] source=backup reason=full-scan-already-ran");
-                    }
-
+                    // V12.5: full-scan ảnh thường chỉ chạy ngay trước hai bước Click
+                    // (bước 1 và 5) trong ExecuteOneStepAsync. Không quét chen giữa
+                    // Click -> dán -> Enter, và không full-scan sau Enter.
                     await ExecuteOneStepAsync(ct);
                     ResetRecoveryFailures("workflow chính đã chạy thành công");
                 }
@@ -365,17 +357,6 @@ public sealed class AutomationEngine
         return min == max ? min : (int)_rng.NextInt64(min, (long)max + 1);
     }
 
-    int AfterClickScanDuration() => _s.AfterClickScanEnabled
-        ? Math.Clamp(_s.AfterClickScanMs, MinPostActionScanMs, ImageScanTimeoutMs)
-        : 0;
-
-    int AfterEnterScanDuration() => _s.AfterEnterScanEnabled
-        ? Math.Max(EnterReactionScanMs, Math.Clamp(_s.AfterEnterScanMs, MinPostActionScanMs, ImageScanTimeoutMs))
-        : 0;
-
-    bool HasRecentFullNonPeriodicScan()
-        => _lastFullNonPeriodicScanAt != DateTime.MinValue
-        && (DateTime.UtcNow - _lastFullNonPeriodicScanAt).TotalMilliseconds <= RecentFullScanFreshMs;
     void SetStatus(string title, string text) => Status?.Invoke(title + "\n" + text);
 
     void ReportProblem(string code, string context, string detail, bool error = false, int throttleSeconds = 15)
@@ -651,14 +632,12 @@ public sealed class AutomationEngine
             {
                 case 1:
                 {
-                    SetStatus("BƯỚC 1/8", $"Click ô nhập 1 • nội dung {_contentIndex + 1}/{_contents.Count}");
-                    _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: click XPath điểm 1.");
+                    SetStatus("BƯỚC 1/8", $"Quét ảnh lỗi → Click ô nhập 1 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (await ScanAndProcessBeforeClickAsync(ct)) return;
+                    _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: quét trước click sạch, click XPath điểm 1.");
                     await ClickRequiredXPathAsync("Điểm/ô nhập 1", _s.XPathPoint1, ct);
                     _step = 2;
-                    var scanMs = AfterClickScanDuration();
-                    var delay = NormalCdpDelay();
-                    if (scanMs > 0 && await FastScanAndProcessAsync(scanMs, ScanMode.AfterClick, 1, _s.XPathPoint1, "điểm 1", ct)) return;
-                    await Task.Delay(Math.Max(1, delay - scanMs), ct);
+                    await Task.Delay(NormalCdpDelay(), ct);
                     break;
                 }
                 case 2:
@@ -670,15 +649,12 @@ public sealed class AutomationEngine
 
                 case 3:
                 {
-                    SetStatus("BƯỚC 3/8", "Enter ô 1 • chờ TikTok phản hồi và quét ảnh lỗi");
+                    SetStatus("BƯỚC 3/8", "Enter ô 1 • chờ TikTok phản hồi");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     _step = 4;
-                    var scanMs = AfterEnterScanDuration();
-                    if (scanMs > 0)
-                    {
-                        if (await FastScanAndProcessAsync(scanMs, ScanMode.AllNonPeriodic, 1, _s.XPathPoint1, "sau Enter điểm 1", ct)) return;
-                    }
-                    else await Task.Delay(EnterReactionScanMs, ct);
+                    // Vẫn giữ đúng khoảng chờ phản hồi cũ; chỉ dời full-scan sang ngay
+                    // trước Click kế tiếp để không thay đổi nhịp nghiệp vụ.
+                    await Task.Delay(EnterReactionScanMs, ct);
                     break;
                 }
                 case 4:
@@ -688,13 +664,12 @@ public sealed class AutomationEngine
 
                 case 5:
                 {
-                    SetStatus("BƯỚC 5/8", $"Click ô nhập 2 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    SetStatus("BƯỚC 5/8", $"Quét ảnh lỗi → Click ô nhập 2 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (await ScanAndProcessBeforeClickAsync(ct)) return;
+                    _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: quét trước click sạch, click XPath điểm 2.");
                     await ClickRequiredXPathAsync("Điểm/ô nhập 2", _s.XPathPoint2, ct);
                     _step = 6;
-                    var scanMs = AfterClickScanDuration();
-                    var delay = NormalCdpDelay();
-                    if (scanMs > 0 && await FastScanAndProcessAsync(scanMs, ScanMode.AfterClick, 5, _s.XPathPoint2, "điểm 2", ct)) return;
-                    await Task.Delay(Math.Max(1, delay - scanMs), ct);
+                    await Task.Delay(NormalCdpDelay(), ct);
                     break;
                 }
                 case 6:
@@ -706,15 +681,10 @@ public sealed class AutomationEngine
 
                 case 7:
                 {
-                    SetStatus("BƯỚC 7/8", "Enter ô 2 • chờ TikTok phản hồi và quét ảnh lỗi");
+                    SetStatus("BƯỚC 7/8", "Enter ô 2 • chờ TikTok phản hồi");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     _step = 8;
-                    var scanMs = AfterEnterScanDuration();
-                    if (scanMs > 0)
-                    {
-                        if (await FastScanAndProcessAsync(scanMs, ScanMode.AllNonPeriodic, 5, _s.XPathPoint2, "sau Enter điểm 2", ct)) return;
-                    }
-                    else await Task.Delay(EnterReactionScanMs, ct);
+                    await Task.Delay(EnterReactionScanMs, ct);
                     break;
                 }
                 case 8:
@@ -750,16 +720,16 @@ public sealed class AutomationEngine
         }
     }
 
-    enum ScanMode { AfterClick, AllNonPeriodic, Priority }
+    enum ScanMode { AllNonPeriodic, Priority }
     sealed record RegionHit(ScanRegion Region, string Template, ImageMatchResult Result);
 
     IEnumerable<ScanRegion> RegionsFor(ScanMode mode)
     {
+        var now = DateTime.Now;
         var q = _s.ScanRegions.Where(r => r.Enabled);
         q = mode switch
         {
-            ScanMode.Priority => q.Where(r => r.PeriodicEnabled && DateTime.Now >= r.NextPeriodicAt),
-            ScanMode.AfterClick => q.Where(r => !r.PeriodicEnabled && r.AfterClick),
+            ScanMode.Priority => q.Where(r => r.PeriodicEnabled && now >= r.NextPeriodicAt),
             _ => q.Where(r => !r.PeriodicEnabled)
         };
         // V10.4.2: STOP luôn được kiểm tra trước cả trong quét thường lẫn ưu tiên.
@@ -792,7 +762,7 @@ public sealed class AutomationEngine
     {
         // Một lượt quét chỉ chụp mỗi XPath/vùng viewport một lần. Nhiều vùng dùng chung
         // room-chat-input-field sẽ tái sử dụng cùng screenshot thay vì bắt Chrome chụp lặp.
-        var captureCache = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        using var captureCache = new ScanCaptureCache();
         var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + ImageScanTimeoutMs * System.Diagnostics.Stopwatch.Frequency / 1000;
         foreach (var region in RegionsFor(mode))
         {
@@ -816,11 +786,17 @@ public sealed class AutomationEngine
         return null;
     }
 
-    async Task<(string template, ImageMatchResult result)?> FindRegionMatchAsync(ScanRegion region, Dictionary<string, byte[]> captureCache, long deadline, CancellationToken ct)
+    async Task<(string template, ImageMatchResult result)?> FindRegionMatchAsync(ScanRegion region, ScanCaptureCache captureCache, long deadline, CancellationToken ct)
     {
         if (_s.StrictXPathOnly && string.IsNullOrWhiteSpace(region.ScanXPath))
         {
             ReportProblem("XPATH_SCAN_MISSING", $"Vùng quét “{region.Name}”", "Chưa cấu hình XPath vùng quét. Đã bỏ qua vùng này; không dùng tọa độ fallback.");
+            return null;
+        }
+
+        if (region.Images.Count == 0)
+        {
+            ReportProblem("IMAGE_TEMPLATE_MISSING", $"Vùng quét “{region.Name}”", "Chưa có ảnh mẫu. Đã bỏ qua vùng này.", throttleSeconds: 60);
             return null;
         }
 
@@ -861,12 +837,6 @@ public sealed class AutomationEngine
 
         using (current)
         {
-            if (region.Images.Count == 0)
-            {
-                ReportProblem("IMAGE_TEMPLATE_MISSING", $"Vùng quét “{region.Name}”", "Chưa có ảnh mẫu. Đã bỏ qua vùng này.", throttleSeconds: 60);
-                return null;
-            }
-
             _log.Info("[PERF_SCAN] TemplateLoad START");
             var templateLoad = System.Diagnostics.Stopwatch.StartNew();
             var templates = new List<(string rel, string path, ImageMatcher.MultiScaleTemplate template)>(region.Images.Count);
@@ -962,12 +932,12 @@ public sealed class AutomationEngine
         return true;
     }
 
-    async Task<bool> ScanAndProcessAtBoundaryAsync(ScanMode mode, CancellationToken ct)
+    async Task<bool> ScanAndProcessBeforeClickAsync(CancellationToken ct)
     {
         var perf = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var hit = await FindFirstMatchAsync(mode, ct);
+            var hit = await FindFirstMatchAsync(ScanMode.AllNonPeriodic, ct);
             if (hit is null)
             {
                 if (_consecutiveCount > 0) ResetConsecutive("không còn ảnh lỗi ở lần quét kế tiếp");
@@ -985,51 +955,7 @@ public sealed class AutomationEngine
         finally
         {
             perf.Stop();
-            _log.Info($"[STEP_PERF] step=boundaryScan:{mode} elapsedMs={perf.ElapsedMilliseconds}");
-        }
-    }
-
-    async Task<bool> FastScanAndProcessAsync(int durationMs, ScanMode mode, int restartStep, string inputXPath, string pointName, CancellationToken ct)
-    {
-        var perf = System.Diagnostics.Stopwatch.StartNew();
-        var completedWithoutHit = false;
-        var end = Environment.TickCount64 + durationMs;
-        try
-        {
-            while (_running && !_paused && Environment.TickCount64 <= end)
-            {
-                if (HasPriorityDue())
-                {
-                    await HandlePriorityDueAsync(ct);
-                    return true;
-                }
-                var hit = await FindFirstMatchAsync(mode, ct);
-                if (hit is not null)
-                {
-                    if (hit.Region.Action.Equals("STOP", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ResetConsecutive("chuyển sang vùng STOP");
-                        Stop($"Vùng ảnh STOP “{hit.Region.Name}” đã khớp ổn định 3 lần; ảnh={hit.Template}");
-                        return true;
-                    }
-                    await ProcessImageRegionAsync(hit, restartStep, inputXPath, pointName, ct);
-                    return true;
-                }
-                // Do not let the last poll add a full scan interval after the
-                // observation window has already elapsed.
-                var remainingMs = end - Environment.TickCount64;
-                if (remainingMs <= 0) break;
-                await Task.Delay((int)Math.Min(ScanIntervalMs, remainingMs), ct);
-            }
-            completedWithoutHit = true;
-            return false;
-        }
-        finally
-        {
-            perf.Stop();
-            if (completedWithoutHit && mode == ScanMode.AllNonPeriodic)
-                _lastFullNonPeriodicScanAt = DateTime.UtcNow;
-            _log.Info($"[STEP_PERF] step=fastScan:{mode} elapsedMs={perf.ElapsedMilliseconds}");
+            _log.Info($"[STEP_PERF] step=preClickScan:AllNonPeriodic elapsedMs={perf.ElapsedMilliseconds}");
         }
     }
 
@@ -2040,45 +1966,69 @@ public sealed class AutomationEngine
         return verify;
     }
 
-    async Task<ImageMatcher.PreparedBitmap> CaptureScanRegionAsync(ScanRegion region, CancellationToken ct, Dictionary<string, byte[]>? cache = null)
+    async Task<ImageMatcher.PreparedBitmap> CaptureScanRegionAsync(ScanRegion region, CancellationToken ct, ScanCaptureCache? cache = null)
     {
-        const string viewportKey = "__VIEWPORT__";
-        byte[]? bytes = null;
-        if (cache is not null) cache.TryGetValue(viewportKey, out bytes);
-        if (bytes is null)
+        Bitmap? ownedBitmap = null;
+        var bmp = cache?.ViewportBitmap;
+        if (bmp is null)
         {
-            bytes = await _chrome.CaptureViewportAsync(ct);
-            cache?.Add(viewportKey, bytes);
+            var bytes = cache?.ViewportBytes;
+            if (bytes is null)
+            {
+                bytes = await _chrome.CaptureViewportAsync(ct);
+                if (cache is not null) cache.ViewportBytes = bytes;
+            }
+
+            _log.Info("[PERF_SCAN] Decode START");
+            var decode = System.Diagnostics.Stopwatch.StartNew();
+            var decoded = ImageMatcher.FromBytes(bytes);
+            decode.Stop();
+            _log.Info($"[PERF_SCAN] Decode DONE elapsed={decode.ElapsedMilliseconds}ms");
+
+            if (cache is not null)
+            {
+                cache.ViewportBitmap = decoded;
+                bmp = decoded;
+            }
+            else
+            {
+                ownedBitmap = decoded;
+                bmp = decoded;
+            }
         }
 
-        _log.Info("[PERF_SCAN] Decode START");
-        var decode = System.Diagnostics.Stopwatch.StartNew();
-        using var bmp = ImageMatcher.FromBytes(bytes);
-        decode.Stop();
-        _log.Info($"[PERF_SCAN] Decode DONE elapsed={decode.ElapsedMilliseconds}ms");
+        try
+        {
+            _log.Info("[PERF_SCAN] ResolveROI START");
+            var resolve = System.Diagnostics.Stopwatch.StartNew();
+            var rect = await ResolveScanRectangleAsync(bmp, region.ScanXPath, region.RX1, region.RY1, region.RX2, region.RY2, ct, cache);
+            resolve.Stop();
+            _log.Info($"[PERF_SCAN] ResolveROI DONE elapsed={resolve.ElapsedMilliseconds}ms");
 
-        _log.Info("[PERF_SCAN] ResolveROI START");
-        var resolve = System.Diagnostics.Stopwatch.StartNew();
-        var rect = await ResolveScanRectangleAsync(bmp, region.ScanXPath, region.RX1, region.RY1, region.RX2, region.RY2, ct);
-        resolve.Stop();
-        _log.Info($"[PERF_SCAN] ResolveROI DONE elapsed={resolve.ElapsedMilliseconds}ms");
-
-        _log.Info("[PERF_SCAN] Crop START");
-        var crop = System.Diagnostics.Stopwatch.StartNew();
-        using var roi = bmp.Clone(rect, bmp.PixelFormat);
-        var prepared = new ImageMatcher.PreparedBitmap(roi);
-        crop.Stop();
-        _log.Info($"[PERF_SCAN] Crop DONE elapsed={crop.ElapsedMilliseconds}ms");
-        return prepared;
+            _log.Info("[PERF_SCAN] Crop START");
+            var crop = System.Diagnostics.Stopwatch.StartNew();
+            using var roi = bmp.Clone(rect, bmp.PixelFormat);
+            var prepared = new ImageMatcher.PreparedBitmap(roi);
+            crop.Stop();
+            _log.Info($"[PERF_SCAN] Crop DONE elapsed={crop.ElapsedMilliseconds}ms");
+            return prepared;
+        }
+        finally
+        {
+            ownedBitmap?.Dispose();
+        }
     }
 
-    async Task<Rectangle> ResolveScanRectangleAsync(Bitmap bmp, string xpath, double rx1, double ry1, double rx2, double ry2, CancellationToken ct)
+    async Task<Rectangle> ResolveScanRectangleAsync(Bitmap bmp, string xpath, double rx1, double ry1, double rx2, double ry2, CancellationToken ct, ScanCaptureCache? cache = null)
     {
+        Rectangle resolved;
         if (!string.IsNullOrWhiteSpace(xpath))
         {
             var box = await _chrome.GetBoxNoScrollAsync(xpath, ct)
                 ?? throw new InvalidOperationException("Không tìm thấy XPath: " + xpath);
-            var (vw, vh) = await _chrome.GetViewportSizeAsync(ct);
+            var viewport = cache?.ViewportSize ?? await _chrome.GetViewportSizeAsync(ct);
+            if (cache is not null) cache.ViewportSize = viewport;
+            var (vw, vh) = viewport;
             if (vw <= 0 || vh <= 0) throw new InvalidOperationException("Không đọc được kích thước viewport Chrome.");
             var sx = bmp.Width / (double)vw;
             var sy = bmp.Height / (double)vh;
@@ -2088,13 +2038,13 @@ public sealed class AutomationEngine
             var bottomCss = Math.Min(vh, box.Y + box.Height);
             if (rightCss - leftCss < 2 || bottomCss - topCss < 2)
                 throw new InvalidOperationException("Element XPath đang ngoài viewport hoặc quá nhỏ; tool không tự cuộn để tránh Chrome bị giật.");
-            var rect = Rectangle.FromLTRB(
+            resolved = Rectangle.FromLTRB(
                 Math.Clamp((int)Math.Floor(leftCss * sx), 0, bmp.Width - 1),
                 Math.Clamp((int)Math.Floor(topCss * sy), 0, bmp.Height - 1),
                 Math.Clamp((int)Math.Ceiling(rightCss * sx), 1, bmp.Width),
                 Math.Clamp((int)Math.Ceiling(bottomCss * sy), 1, bmp.Height));
-            if (rect.Width < 2 || rect.Height < 2) throw new InvalidOperationException("Vùng XPath sau quy đổi screenshot quá nhỏ.");
-            return rect;
+            if (resolved.Width < 2 || resolved.Height < 2) throw new InvalidOperationException("Vùng XPath sau quy đổi screenshot quá nhỏ.");
+            return resolved;
         }
 
         if (_s.StrictXPathOnly)
@@ -2108,7 +2058,8 @@ public sealed class AutomationEngine
         var y1 = Math.Clamp((int)Math.Round(Math.Min(ry1, ry2) * bmp.Height), 0, Math.Max(0, bmp.Height - 1));
         var x2 = Math.Clamp((int)Math.Round(Math.Max(rx1, rx2) * bmp.Width), x1 + 1, bmp.Width);
         var y2 = Math.Clamp((int)Math.Round(Math.Max(ry1, ry2) * bmp.Height), y1 + 1, bmp.Height);
-        return Rectangle.FromLTRB(x1, y1, x2, y2);
+        resolved = Rectangle.FromLTRB(x1, y1, x2, y2);
+        return resolved;
     }
 
     ImageMatcher.MultiScaleTemplate GetOrLoadTemplate(string path)

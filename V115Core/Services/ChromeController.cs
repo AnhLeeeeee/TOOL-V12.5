@@ -109,7 +109,7 @@ public sealed class ChromeController : IAsyncDisposable
 
         await CloseBrowserOnPortAsync(port);
         await WaitForProfileReleaseAsync(profileDir, TimeSpan.FromSeconds(4));
-        var owners = FindChromeProcessesUsingProfile(profileDir);
+        var owners = await FindChromeProcessesUsingProfileAsync(profileDir, TimeSpan.FromSeconds(4));
         if (owners.Count > 0)
         {
             var detail = string.Join(" | ", owners.Select(x => $"PID={x.ProcessId}"));
@@ -151,11 +151,53 @@ public sealed class ChromeController : IAsyncDisposable
 
     async Task WaitForProfileReleaseAsync(string profileDir, TimeSpan timeout)
     {
+        // Query command lines once, then wait on the exact PIDs we found.  The
+        // old loop spawned powershell.exe + CIM every 250 ms.  LaunchAsync still
+        // performs a final owner query, so a newly acquired profile is detected.
         var end = DateTime.UtcNow + timeout;
+        var owners = await FindChromeProcessesUsingProfileAsync(profileDir, timeout);
+        if (owners.Count == 0) return;
+
         while (DateTime.UtcNow < end)
         {
-            if (FindChromeProcessesUsingProfile(profileDir).Count == 0) return;
+            if (owners.All(owner => !IsProcessRunning(owner.ProcessId))) return;
             await Task.Delay(250);
+        }
+    }
+
+    async Task<List<ProfileOwner>> FindChromeProcessesUsingProfileAsync(string profileDir, TimeSpan timeout)
+    {
+        try
+        {
+            using var p = CreateProfileOwnerQuery(profileDir);
+            p.Start();
+            var outputTask = p.StandardOutput.ReadToEndAsync();
+            var errorTask = p.StandardError.ReadToEndAsync();
+            using var cts = new CancellationTokenSource(timeout);
+            try
+            {
+                await p.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                try { p.Kill(true); } catch { }
+                _log.Warn("Kiểm tra tiến trình Chrome đang giữ profile bị timeout; bỏ qua kiểm tra owner.");
+                return [];
+            }
+
+            var output = (await outputTask).Trim();
+            var err = (await errorTask).Trim();
+            if (p.ExitCode != 0)
+            {
+                _log.Warn("Kiểm tra owner của Chrome profile thất bại: " + err);
+                return [];
+            }
+            return ParseProfileOwners(output);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Không kiểm tra được owner của Chrome profile: " + ex.Message);
+            return [];
         }
     }
 
@@ -163,21 +205,7 @@ public sealed class ChromeController : IAsyncDisposable
     {
         try
         {
-            using var p = new Process();
-            p.StartInfo = new ProcessStartInfo("powershell.exe",
-                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " +
-                "\"$t=$env:TARGET_PROFILE; " +
-                "$items=Get-CimInstance Win32_Process -Filter \\\"Name = 'chrome.exe'\\\" | " +
-                "Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | " +
-                "Select-Object ProcessId, CommandLine; " +
-                "if($items){ $items | ConvertTo-Json -Compress }\"")
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            p.StartInfo.Environment["TARGET_PROFILE"] = profileDir;
+            using var p = CreateProfileOwnerQuery(profileDir);
             p.Start();
             if (!p.WaitForExit(4000))
             {
@@ -193,21 +221,45 @@ public sealed class ChromeController : IAsyncDisposable
                 _log.Warn("Kiểm tra owner của Chrome profile thất bại: " + err);
                 return [];
             }
-            if (string.IsNullOrWhiteSpace(output)) return [];
-
-            using var doc = JsonDocument.Parse(output);
-            var list = new List<ProfileOwner>();
-            if (doc.RootElement.ValueKind == JsonValueKind.Object)
-                ReadOwner(doc.RootElement, list);
-            else if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                foreach (var item in doc.RootElement.EnumerateArray()) ReadOwner(item, list);
-            return list;
+            return ParseProfileOwners(output);
         }
         catch (Exception ex)
         {
             _log.Warn("Không kiểm tra được owner của Chrome profile: " + ex.Message);
             return [];
         }
+    }
+
+    static Process CreateProfileOwnerQuery(string profileDir)
+    {
+        var p = new Process();
+        p.StartInfo = new ProcessStartInfo("powershell.exe",
+            "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " +
+            "\"$t=$env:TARGET_PROFILE; " +
+            "$items=Get-CimInstance Win32_Process -Filter \\\"Name = 'chrome.exe'\\\" | " +
+            "Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | " +
+            "Select-Object ProcessId, CommandLine; " +
+            "if($items){ $items | ConvertTo-Json -Compress }\"")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        p.StartInfo.Environment["TARGET_PROFILE"] = profileDir;
+        return p;
+    }
+
+    static List<ProfileOwner> ParseProfileOwners(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output)) return [];
+        using var doc = JsonDocument.Parse(output);
+        var list = new List<ProfileOwner>();
+        if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            ReadOwner(doc.RootElement, list);
+        else if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            foreach (var item in doc.RootElement.EnumerateArray()) ReadOwner(item, list);
+        return list;
     }
 
     static void ReadOwner(JsonElement item, List<ProfileOwner> list)
@@ -477,15 +529,6 @@ public sealed class ChromeController : IAsyncDisposable
 
     async Task<ProfileOwner?> InspectExistingChromeProcessAsync(int pid, string profileDir)
     {
-        var owner = await Task.Run(() => InspectExistingChromeProcess(pid));
-        if (owner is null) return null;
-        var matched = CommandLineUsesProfile(owner.CommandLine, profileDir);
-        if (!matched) _log.Info($"[CHROME_CLOSE_OWNER_VERIFY] pid={pid} matched=False");
-        return matched ? owner : null;
-    }
-
-    ProfileOwner? InspectExistingChromeProcess(int pid)
-    {
         try
         {
             using var process = Process.GetProcessById(pid);
@@ -502,14 +545,25 @@ public sealed class ChromeController : IAsyncDisposable
                 }
             };
             query.Start();
-            if (!query.WaitForExit(1500))
+            var outputTask = query.StandardOutput.ReadToEndAsync();
+            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
+            try
+            {
+                await query.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
                 try { query.Kill(entireProcessTree: true); } catch { }
                 _log.Warn($"[CHROME_CLOSE_OWNER_VERIFY] pid={pid} matched=False reason=lookup-timeout");
                 return null;
             }
-            var commandLine = query.StandardOutput.ReadToEnd().Trim();
-            return string.IsNullOrWhiteSpace(commandLine) ? null : new ProfileOwner(pid, commandLine);
+
+            var commandLine = (await outputTask).Trim();
+            if (string.IsNullOrWhiteSpace(commandLine)) return null;
+            var owner = new ProfileOwner(pid, commandLine);
+            var matched = CommandLineUsesProfile(owner.CommandLine, profileDir);
+            if (!matched) _log.Info($"[CHROME_CLOSE_OWNER_VERIFY] pid={pid} matched=False");
+            return matched ? owner : null;
         }
         catch (Exception ex)
         {

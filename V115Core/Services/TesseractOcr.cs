@@ -8,16 +8,22 @@ namespace ToolTikTokV11.Services;
 public sealed partial class TesseractOcr
 {
     readonly Logger _log;
+    string? _cachedExe;
     public TesseractOcr(Logger log) => _log = log;
 
     public string? FindExe()
     {
+        // Cache only a successful lookup.  If Tesseract was not installed yet,
+        // subsequent calls still re-check so installing it while the tool is
+        // running keeps the previous behavior.
+        if (!string.IsNullOrWhiteSpace(_cachedExe) && File.Exists(_cachedExe)) return _cachedExe;
         string[] c =
         [
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Tesseract-OCR", "tesseract.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Tesseract-OCR", "tesseract.exe")
         ];
-        return c.FirstOrDefault(File.Exists);
+        _cachedExe = c.FirstOrDefault(File.Exists);
+        return _cachedExe;
     }
 
     public async Task<string> ReadAsync(string imagePath, CancellationToken ct = default)

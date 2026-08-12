@@ -1,4 +1,7 @@
 ﻿using System.Runtime.InteropServices;
+using System.Collections.Concurrent;
+using System.Text;
+using ToolTikTokV12.Controls;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Services;
 using ToolTikTokV11.Utils;
@@ -39,7 +42,7 @@ public sealed partial class MainForm : Form
     readonly Label _roundState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Vòng: 0", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _periodicState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "↓ + F5 định kỳ: chưa chạy.", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _lastError = new() { AutoSize = false, Dock = DockStyle.Fill, ForeColor = Color.Firebrick, Text = "Lỗi: không có", TextAlign = ContentAlignment.MiddleLeft };
-    readonly DataGridView _regions = new() { Dock = DockStyle.Fill, AllowUserToAddRows = true, AllowUserToDeleteRows = true, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None };
+    readonly DataGridView _regions = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None };
     readonly TextBox _logBox = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = false, Dock = DockStyle.Fill };
     readonly TextBox _errorBox = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill };
     readonly ToolTip _toolTip = new() { AutoPopDelay = 12000, InitialDelay = 300, ReshowDelay = 200, ShowAlways = true };
@@ -64,6 +67,9 @@ public sealed partial class MainForm : Form
     readonly Label _oldDiagScore = new() { AutoSize = true, Text = "Điểm sai khác / score: —" };
     readonly DataGridView _oldLiveGrid = new() { Dock = DockStyle.Top, Height = 180, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill };
     readonly System.Windows.Forms.Timer _periodicUiTimer = new() { Interval = 1000, Enabled = true };
+    readonly System.Windows.Forms.Timer _logUiTimer = new() { Interval = 100, Enabled = true };
+    readonly ConcurrentQueue<string> _pendingLogLines = new();
+    string[] _oldLiveEntryIds = Array.Empty<string>();
     string _chromeStateText = "Trạng thái Chrome: ⚪ Chưa mở Chrome";
     string _chromePageStateText = "TikTok: —";
     Color _chromeStateColor = Color.DimGray;
@@ -76,6 +82,14 @@ public sealed partial class MainForm : Form
     bool _startStopCommandInFlight;
     bool _stopCommandInFlight;
     bool _pauseResumeCommandInFlight;
+    int _hoveredTabIndex = -1;
+
+    static readonly Color ActiveTabColor = Color.FromArgb(26, 83, 145);
+    static readonly Color ActiveTabUnderlineColor = Color.FromArgb(113, 181, 237);
+    static readonly Color InactiveTabColor = Color.FromArgb(248, 249, 251);
+    static readonly Color HoveredTabColor = Color.FromArgb(226, 239, 253);
+    static readonly Color TabBorderColor = Color.FromArgb(214, 220, 230);
+    static readonly Color InactiveTabTextColor = Color.FromArgb(55, 65, 81);
 
     const int HOTKEY_START = 101, HOTKEY_PAUSE = 102, HOTKEY_STOP = 103;
 
@@ -158,6 +172,7 @@ public sealed partial class MainForm : Form
         }
         _log.LineWritten += OnLog; _engine.Status += OnEngineStatus; _engine.Problem += OnEngineProblem; _engine.StateChanged += OnEngineState;
         _periodicUiTimer.Tick += (_, _) => RefreshUiStatusLabels();
+        _logUiTimer.Tick += (_, _) => FlushPendingLogLines();
         Shown += (_, _) =>
         {
             _log.Info($"[PERF] Form shown: {ctorSw.ElapsedMilliseconds} ms");
@@ -183,7 +198,8 @@ public sealed partial class MainForm : Form
 
     void BuildUi()
     {
-        var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(14, 5) };
+        var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(14, 5), DrawMode = TabDrawMode.OwnerDrawFixed };
+        ConfigureTabAppearance(tabs);
         tabs.TabPages.Add(BuildGeneralTab()); tabs.TabPages.Add(BuildRegionsTab()); tabs.TabPages.Add(BuildViewerTab()); tabs.TabPages.Add(BuildOldLiveTab()); tabs.TabPages.Add(BuildDiagnosticsTab()); tabs.TabPages.Add(BuildLogTab());
         Controls.Add(tabs);
         // Khu vực chạy được tách nhiều dòng để không kéo dài giao diện theo chiều ngang.
@@ -215,6 +231,66 @@ public sealed partial class MainForm : Form
         Controls.Add(bottom);
         ApplyStatusStyles();
         UpdateRunControlButtons();
+    }
+
+    void ConfigureTabAppearance(TabControl tabs)
+    {
+        tabs.DrawItem += (_, e) => DrawTab(tabs, e);
+        tabs.SelectedIndexChanged += (_, _) => tabs.Invalidate();
+        tabs.MouseMove += (_, e) => UpdateHoveredTab(tabs, e.Location);
+        tabs.MouseLeave += (_, _) => SetHoveredTab(tabs, -1);
+
+        // When the pointer enters the page content, clear the header hover state.
+        tabs.ControlAdded += (_, e) =>
+        {
+            if (e.Control is TabPage page)
+                page.MouseMove += (_, _) => SetHoveredTab(tabs, -1);
+        };
+    }
+
+    void DrawTab(TabControl tabs, DrawItemEventArgs e)
+    {
+        if (e.Index < 0 || e.Index >= tabs.TabPages.Count) return;
+
+        var active = e.Index == tabs.SelectedIndex;
+        var hovered = !active && e.Index == _hoveredTabIndex;
+        var background = active ? ActiveTabColor : hovered ? HoveredTabColor : InactiveTabColor;
+        var foreground = active ? Color.White : InactiveTabTextColor;
+
+        using (var backgroundBrush = new SolidBrush(background))
+            e.Graphics.FillRectangle(backgroundBrush, e.Bounds);
+        using (var borderPen = new Pen(active ? ActiveTabColor : TabBorderColor))
+            e.Graphics.DrawRectangle(borderPen, e.Bounds.X, e.Bounds.Y, e.Bounds.Width - 1, e.Bounds.Height - 1);
+        if (active)
+        {
+            var underlineHeight = Math.Min(3, e.Bounds.Height);
+            using var underlineBrush = new SolidBrush(ActiveTabUnderlineColor);
+            e.Graphics.FillRectangle(underlineBrush, e.Bounds.X, e.Bounds.Bottom - underlineHeight, e.Bounds.Width, underlineHeight);
+        }
+
+        using Font? activeFont = active ? new Font(tabs.Font, FontStyle.Bold) : null;
+        var textBounds = new Rectangle(e.Bounds.X + 6, e.Bounds.Y + 2, e.Bounds.Width - 12, e.Bounds.Height - 4);
+        TextRenderer.DrawText(e.Graphics, tabs.TabPages[e.Index].Text, activeFont ?? tabs.Font, textBounds, foreground,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
+    }
+
+    void UpdateHoveredTab(TabControl tabs, Point location)
+    {
+        var hoveredIndex = -1;
+        for (var i = 0; i < tabs.TabCount; i++)
+        {
+            if (!tabs.GetTabRect(i).Contains(location)) continue;
+            hoveredIndex = i;
+            break;
+        }
+        SetHoveredTab(tabs, hoveredIndex);
+    }
+
+    void SetHoveredTab(TabControl tabs, int hoveredIndex)
+    {
+        if (_hoveredTabIndex == hoveredIndex) return;
+        _hoveredTabIndex = hoveredIndex;
+        tabs.Invalidate();
     }
 
     void InitializeContentEditor()
@@ -570,10 +646,15 @@ public sealed partial class MainForm : Form
     void ShowXPathEditor(string name, TextBox source)
     {
         using var f = new Form { Text = "XPath — " + name, Width = 720, Height = 230, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false };
+        ModernDialog.Apply(f);
         var edit = new TextBox { Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill, Text = source.Text, Font = new Font("Consolas", 9F) };
-        var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 46, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(6), WrapContents = false };
+        edit.BackColor = Color.White;
+        edit.BorderStyle = BorderStyle.FixedSingle;
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 58, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(8), WrapContents = false };
         var ok = new Button { Text = "Lưu XPath", AutoSize = true, DialogResult = DialogResult.OK };
         var cancel = new Button { Text = "Hủy", AutoSize = true, DialogResult = DialogResult.Cancel };
+        ModernDialog.StylePrimaryButton(ok);
+        ModernDialog.StyleSecondaryButton(cancel);
         bar.Controls.Add(ok); bar.Controls.Add(cancel); f.Controls.Add(edit); f.Controls.Add(bar); f.AcceptButton = ok; f.CancelButton = cancel;
         if (f.ShowDialog(this) == DialogResult.OK) source.Text = edit.Text.Trim();
     }
@@ -664,14 +745,18 @@ public sealed partial class MainForm : Form
     {
         var tab = new TabPage("Vùng quét ảnh"); ConfigureRegionGrid();
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(6), WrapContents = true };
+        top.Controls.Add(Btn("+ Thêm dòng", (_, _) => AddRegionRow()));
+        top.Controls.Add(Btn("Xóa dòng", (_, _) => DeleteSelectedRegionRow()));
         top.Controls.Add(Btn("Lấy XPath vùng quét", async (_, _) => await PickRegionCellAsync("ScanXPath")));
         top.Controls.Add(Btn("Lấy XPath nút bấm", async (_, _) => await PickRegionCellAsync("ActionXPath")));
         top.Controls.Add(Btn("Quét thử dòng chọn", async (_, _) => await TestSelectedRegionAsync()));
         top.Controls.Add(Btn("Quét thử tất cả", async (_, _) => await TestAllRegionsAsync()));
         top.Controls.Add(Btn("Chụp XPath làm ảnh mẫu", async (_, _) => await CaptureSelectedRegionTemplateAsync()));
         top.Controls.Add(Btn("Thêm ảnh từ file...", (_, _) => AddImagesToSelectedRegion()));
-        top.Controls.Add(Btn("Xem chi tiết dòng", (_, _) => { if (_regions.CurrentRow is not null && !_regions.CurrentRow.IsNewRow) ShowRegionDetails(_regions.CurrentRow); }));
-        top.Controls.Add(new Label { AutoSize = true, Margin = new Padding(8, 10, 0, 0), Text = "XP chỉ hiện trạng thái; rê chuột hoặc bấm Xem chi tiết để xem đầy đủ." });
+        top.Controls.Add(Btn("Xem ảnh mẫu", (_, _) => { if (_regions.CurrentRow is not null) ViewImagesForRow(_regions.CurrentRow); }));
+        top.Controls.Add(Btn("Xóa ảnh mẫu", (_, _) => { if (_regions.CurrentRow is not null) DeleteImagesFromRow(_regions.CurrentRow); }));
+        top.Controls.Add(Btn("Xem chi tiết dòng", (_, _) => { if (_regions.CurrentRow is not null) ShowRegionDetails(_regions.CurrentRow); }));
+        top.Controls.Add(new Label { AutoSize = true, Margin = new Padding(8, 10, 0, 0), Text = "Quét thường chạy trước Click 1/2; cột định kỳ vẫn giữ riêng cho vùng ưu tiên. XP chỉ hiện trạng thái." });
         tab.Controls.Add(_regions); tab.Controls.Add(top); return tab;
     }
 
@@ -684,19 +769,9 @@ public sealed partial class MainForm : Form
         _regions.BackgroundColor = SystemColors.Window;
         _regions.BorderStyle = BorderStyle.FixedSingle;
         _regions.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(248, 249, 250);
-        _regions.CellContentClick += async (_, e) =>
-        {
-            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            var row = _regions.Rows[e.RowIndex];
-            if (row.IsNewRow) return;
-            var col = _regions.Columns[e.ColumnIndex].Name;
-            if (col == "TestRow") await TestRegionRowAsync(row);
-            else if (col == "ViewImages") ViewImagesForRow(row);
-            else if (col == "DeleteImages") DeleteImagesFromRow(row);
-        };
         _regions.CellDoubleClick += (_, e) =>
         {
-            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && !_regions.Rows[e.RowIndex].IsNewRow &&
+            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 &&
                 (_regions.Columns[e.ColumnIndex].Name is "ScanXPathState" or "ActionXPathState" or "ImagesState"))
                 ShowRegionDetails(_regions.Rows[e.RowIndex]);
         };
@@ -706,26 +781,27 @@ public sealed partial class MainForm : Form
         };
         _regions.CellValueChanged += (_, e) =>
         {
-            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && !_regions.Rows[e.RowIndex].IsNewRow &&
+            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 &&
                 _regions.Columns[e.ColumnIndex].Name is "Action" or "ScanXPath" or "ActionXPath" or "Images")
                 UpdateRegionStatus(_regions.Rows[e.RowIndex]);
         };
+
+        // Chỉ giữ các cột cần để vận hành/cấu hình. Các nút Test/Xem/Xóa ảnh
+        // đã được đưa lên thanh công cụ nên không lặp lại trên từng dòng.
         _regions.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = "Bật", Width = 38 });
-        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Tên vùng", Width = 142 });
-        _regions.Columns.Add(new DataGridViewCheckBoxColumn { Name = "AfterClick", HeaderText = "Sau click", Width = 58 });
+        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Tên vùng", Width = 160 });
         _regions.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Periodic", HeaderText = "Định kỳ", Width = 58 });
         _regions.Columns.Add(new DataGridViewComboBoxColumn { Name = "PeriodMin", HeaderText = "Chu kỳ", Width = 62, DataSource = new[] { 10, 30, 60, 120, 240, 480 } });
         _regions.Columns.Add(new DataGridViewComboBoxColumn { Name = "Action", HeaderText = "Hành động", Width = 92, DataSource = new[] { "F5", "CLICK_F5", "STOP" } });
-        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Variation", HeaderText = "Sai số", Width = 50 });
-        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Consecutive", HeaderText = "Lỗi LT", Width = 50 });
+        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Variation", HeaderText = "Sai số", Width = 54 });
+        _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Consecutive", HeaderText = "Lỗi LT", Width = 54 });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "ScanXPathState", HeaderText = "XP quét", Width = 72, ReadOnly = true });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "ActionXPathState", HeaderText = "XP bấm", Width = 72, ReadOnly = true });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "ImagesState", HeaderText = "Ảnh mẫu", Width = 76, ReadOnly = true });
-        _regions.Columns.Add(new DataGridViewButtonColumn { Name = "TestRow", HeaderText = "Test", Text = "Quét thử", UseColumnTextForButtonValue = true, Width = 68 });
-        _regions.Columns.Add(new DataGridViewButtonColumn { Name = "ViewImages", HeaderText = "Xem", Text = "Xem ảnh", UseColumnTextForButtonValue = true, Width = 62 });
-        _regions.Columns.Add(new DataGridViewButtonColumn { Name = "DeleteImages", HeaderText = "Xóa", Text = "Xóa ảnh", UseColumnTextForButtonValue = true, Width = 62 });
 
-        // Dữ liệu đầy đủ vẫn được giữ nhưng ẩn khỏi giao diện để bảng gọn hơn.
+        // Dữ liệu tương thích ngược vẫn được giữ ẩn. AfterClick không còn được runtime
+        // dùng từ V12.5 pre-click scan, nhưng giữ giá trị để không phá file cấu hình cũ.
+        _regions.Columns.Add(new DataGridViewCheckBoxColumn { Name = "AfterClick", HeaderText = "Sau click", Visible = false });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "ScanXPath", HeaderText = "XPath vùng quét", Visible = false });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "ActionXPath", HeaderText = "XPath nút bấm", Visible = false });
         _regions.Columns.Add(new DataGridViewTextBoxColumn { Name = "Images", HeaderText = "Ảnh mẫu (|)", Visible = false });
@@ -911,13 +987,48 @@ public sealed partial class MainForm : Form
     void LoadRegions()
     {
         _regions.Rows.Clear();
-        foreach (var r in _settings.ScanRegions)
+        foreach (var r in _settings.ScanRegions) AddRegionRow(r);
+    }
+
+    void AddRegionRow(ScanRegion? source = null)
+    {
+        var rowIndex = _regions.Rows.Add();
+        var row = _regions.Rows[rowIndex];
+        var nextNumber = rowIndex + 1;
+        row.Cells["Enabled"].Value = source?.Enabled ?? true;
+        row.Cells["Name"].Value = source?.Name ?? $"Vùng mới {nextNumber}";
+        row.Cells["Periodic"].Value = source?.PeriodicEnabled ?? false;
+        row.Cells["PeriodMin"].Value = source?.PeriodicMinutes ?? 10;
+        row.Cells["Action"].Value = source?.Action ?? "CLICK_F5";
+        row.Cells["Variation"].Value = source?.Variation ?? 55;
+        row.Cells["Consecutive"].Value = source?.ConsecutiveMax ?? 2;
+        row.Cells["AfterClick"].Value = source?.AfterClick ?? false;
+        row.Cells["ScanXPath"].Value = source?.ScanXPath ?? "";
+        row.Cells["ActionXPath"].Value = source?.ActionXPath ?? "";
+        row.Cells["Images"].Value = source is null ? "" : string.Join('|', source.Images);
+        row.Cells["RX1"].Value = source?.RX1 ?? 0d;
+        row.Cells["RY1"].Value = source?.RY1 ?? 0d;
+        row.Cells["RX2"].Value = source?.RX2 ?? 0d;
+        row.Cells["RY2"].Value = source?.RY2 ?? 0d;
+        UpdateRegionStatus(row);
+
+        if (source is null)
         {
-            var rowIndex = _regions.Rows.Add(r.Enabled, r.Name, r.AfterClick, r.PeriodicEnabled, r.PeriodicMinutes, r.Action, r.Variation, r.ConsecutiveMax,
-                XPathState(r.ScanXPath), ActionXPathState(r.Action, r.ActionXPath), ImageState(r.Images), null, null, null,
-                r.ScanXPath, r.ActionXPath, string.Join('|', r.Images), r.RX1, r.RY1, r.RX2, r.RY2);
-            UpdateRegionStatus(_regions.Rows[rowIndex]);
+            _regions.ClearSelection();
+            row.Selected = true;
+            _regions.CurrentCell = row.Cells["Name"];
+            _regions.BeginEdit(true);
         }
+    }
+
+    void DeleteSelectedRegionRow()
+    {
+        var row = _regions.CurrentRow;
+        if (row is null) return;
+        var name = S(row, "Name", "vùng đang chọn");
+        if (MessageBox.Show($"Xóa dòng “{name}” khỏi cấu hình?\n\nẢnh mẫu trên ổ đĩa sẽ KHÔNG bị xóa.",
+            "Xóa dòng", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        _regions.Rows.Remove(row);
     }
 
     void SaveFromUi()
@@ -1078,6 +1189,7 @@ public sealed partial class MainForm : Form
             FormBorderStyle = FormBorderStyle.FixedDialog,
             ShowInTaskbar = false
         };
+        ModernDialog.Apply(f);
         var root = new TableLayoutPanel
         {
             AutoSize = true,
@@ -1099,6 +1211,7 @@ public sealed partial class MainForm : Form
             Text = label,
             Margin = new Padding(0, 0, 0, 6)
         };
+        ModernDialog.StylePrimaryLabel(lbl);
         var box = new TextBox
         {
             Anchor = AnchorStyles.Left | AnchorStyles.Right,
@@ -1107,6 +1220,7 @@ public sealed partial class MainForm : Form
             Text = initialValue,
             Margin = new Padding(0)
         };
+        ModernDialog.StyleTextInput(box);
         var spacer = new Panel
         {
             Dock = DockStyle.Fill,
@@ -1126,6 +1240,8 @@ public sealed partial class MainForm : Form
         };
         var ok = new Button { Text = "OK", AutoSize = true, DialogResult = DialogResult.OK };
         var cancel = new Button { Text = "Hủy", AutoSize = true, DialogResult = DialogResult.Cancel };
+        ModernDialog.StylePrimaryButton(ok);
+        ModernDialog.StyleSecondaryButton(cancel);
         bar.Controls.Add(ok); bar.Controls.Add(cancel);
         root.Controls.Add(lbl, 0, 0);
         root.Controls.Add(box, 0, 1);
@@ -1609,13 +1725,19 @@ public sealed partial class MainForm : Form
         if (images.Count == 0) { MessageBox.Show($"Vùng “{name}” chưa có file ảnh mẫu hợp lệ.", "Xem ảnh", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
         using var f = new Form { Text = $"Ảnh mẫu — {name}", Width = 780, Height = 620, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false };
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8), WrapContents = false };
+        ModernDialog.Apply(f, fixedDialog: false);
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10), WrapContents = false };
         var combo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 470 };
+        ModernDialog.StyleSelectionInput(combo);
         combo.Items.AddRange(images.Select(x => Path.GetFileName(x.full)).Cast<object>().ToArray()); combo.SelectedIndex = 0;
         var pathLabel = new Label { AutoSize = true, Dock = DockStyle.Bottom, Padding = new Padding(8), MaximumSize = new Size(740, 0) };
         var pic = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.FromArgb(32, 32, 32) };
-        top.Controls.Add(new Label { Text = "Ảnh", AutoSize = true, Margin = new Padding(0, 8, 6, 0) }); top.Controls.Add(combo);
-        top.Controls.Add(Btn("Mở thư mục", (_, _) => System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + images[combo.SelectedIndex].full + "\"")));
+        var imageLabel = new Label { Text = "Ảnh", AutoSize = true, Margin = new Padding(0, 8, 6, 0) };
+        ModernDialog.StylePrimaryLabel(imageLabel);
+        var openFolder = Btn("Mở thư mục", (_, _) => System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + images[combo.SelectedIndex].full + "\""));
+        ModernDialog.StyleSecondaryButton(openFolder);
+        top.Controls.Add(imageLabel); top.Controls.Add(combo);
+        top.Controls.Add(openFolder);
         f.Controls.Add(pic); f.Controls.Add(pathLabel); f.Controls.Add(top);
 
         void LoadSelected()
@@ -1631,6 +1753,8 @@ public sealed partial class MainForm : Form
         }
         combo.SelectedIndexChanged += (_, _) => LoadSelected();
         f.FormClosed += (_, _) => pic.Image?.Dispose();
+        f.KeyPreview = true;
+        f.KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) f.Close(); };
         LoadSelected(); f.ShowDialog(this);
     }
 
@@ -1641,12 +1765,18 @@ public sealed partial class MainForm : Form
         if (images.Count == 0) { MessageBox.Show($"Vùng “{name}” chưa có ảnh mẫu để xóa.", "Xóa ảnh"); return; }
 
         using var f = new Form { Text = $"Xóa ảnh mẫu khỏi vùng — {name}", Width = 620, Height = 420, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false };
+        ModernDialog.Apply(f);
         var list = new CheckedListBox { Dock = DockStyle.Fill, CheckOnClick = true };
+        ModernDialog.StyleSelectionList(list);
         foreach (var x in images) list.Items.Add($"{Path.GetFileName(x.full)}   [{x.rel}]", false);
-        var note = new Label { Dock = DockStyle.Top, Height = 42, Padding = new Padding(8), Text = "Chọn ảnh cần bỏ khỏi vùng quét. Tool chỉ xóa khỏi cấu hình vùng, KHÔNG xóa file vật lý để tránh làm hỏng vùng khác đang dùng chung ảnh." };
-        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(6), WrapContents = false };
+        var note = new Label { Dock = DockStyle.Top, Height = 54, Padding = new Padding(10, 8, 10, 0), Text = "Chọn ảnh cần bỏ khỏi vùng quét. Tool chỉ xóa khỏi cấu hình vùng, KHÔNG xóa file vật lý để tránh làm hỏng vùng khác đang dùng chung ảnh." };
+        ModernDialog.StylePrimaryLabel(note);
+        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 58, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(8), WrapContents = false };
         var ok = new Button { Text = "Xóa đã chọn", AutoSize = true, DialogResult = DialogResult.OK }; var cancel = new Button { Text = "Hủy", AutoSize = true, DialogResult = DialogResult.Cancel };
         var all = new Button { Text = "Chọn tất cả", AutoSize = true }; all.Click += (_, _) => { for (int i = 0; i < list.Items.Count; i++) list.SetItemChecked(i, true); };
+        ModernDialog.StyleDestructiveButton(ok);
+        ModernDialog.StyleSecondaryButton(cancel);
+        ModernDialog.StyleSecondaryButton(all);
         bottom.Controls.Add(ok); bottom.Controls.Add(cancel); bottom.Controls.Add(all); f.Controls.Add(list); f.Controls.Add(note); f.Controls.Add(bottom); f.AcceptButton = ok; f.CancelButton = cancel;
         if (f.ShowDialog(this) != DialogResult.OK) return;
         var remove = Enumerable.Range(0, list.Items.Count).Where(list.GetItemChecked).ToHashSet();
@@ -1932,16 +2062,43 @@ public sealed partial class MainForm : Form
 
     void OnLog(string line)
     {
-        if (InvokeRequired) { BeginInvoke(new Action(() => OnLog(line))); return; }
-        _logBox.AppendText(line + Environment.NewLine); if (_logBox.TextLength > 200000) _logBox.Text = _logBox.Text[^150000..]; _logBox.SelectionStart = _logBox.TextLength; _logBox.ScrollToCaret();
+        // Logger callbacks can be very frequent during image matching.  Queue
+        // them and let one UI timer append a batch instead of posting one
+        // BeginInvoke + redraw + ScrollToCaret for every PERF line.
+        _pendingLogLines.Enqueue(line);
+    }
+
+    void FlushPendingLogLines()
+    {
+        if (_pendingLogLines.IsEmpty || _logBox.IsDisposed) return;
+
+        var batch = new StringBuilder();
+        var count = 0;
+        while (count < 500 && _pendingLogLines.TryDequeue(out var line))
+        {
+            batch.AppendLine(line);
+            count++;
+        }
+        if (batch.Length == 0) return;
+
+        _logBox.AppendText(batch.ToString());
+        if (_logBox.TextLength > 200000)
+        {
+            var keep = Math.Min(150000, _logBox.TextLength);
+            _logBox.Text = _logBox.Text[^keep..];
+        }
+        _logBox.SelectionStart = _logBox.TextLength;
+        _logBox.ScrollToCaret();
     }
 
     void OnEngineStatus(string s)
     {
         var p = s.Split('\n', 2); var title = p[0]; var body = p.Length > 1 ? p[1] : "";
+        var detailText = "Bước: " + (string.IsNullOrWhiteSpace(body) ? "—" : body.Replace("\r", " ").Replace("\n", " • "));
+        Volatile.Write(ref _managedDetailSnapshot, detailText);
         if (InvokeRequired) { BeginInvoke(new Action(() => OnEngineStatus(s))); return; }
         _runState.Text = "Trạng thái: " + title;
-        _runDetail.Text = "Bước: " + (string.IsNullOrWhiteSpace(body) ? "—" : body.Replace("\r", " ").Replace("\n", " • "));
+        _runDetail.Text = detailText;
         _runDetail.Tag = body;
         _roundState.Text = "Vòng: " + _engine.Rounds;
         _runState.ForeColor = title switch
@@ -1998,16 +2155,42 @@ public sealed partial class MainForm : Form
     void RefreshOldLiveDiagnostics()
     {
         var snap = _engine.GetOldLiveDiagnosticsSnapshot();
-        _oldDiagSummary.Text = $"Số ảnh Live cũ active: {snap.ActiveCount}";
-        _oldDiagCapturedAt.Text = "Lần lưu Live cũ gần nhất: " + FormatDateTime(snap.LastCapturedAt);
-        _oldDiagMatchAt.Text = "Lần match gần nhất: " + FormatDateTime(snap.LastMatchAt);
-        _oldDiagMatch.Text = "Kết quả match gần nhất: " + (snap.LastMatchFound is null ? "—" : snap.LastMatchFound.Value ? "KHỚP" : "KHÔNG KHỚP");
-        _oldDiagMatchImage.Text = "Ảnh match gần nhất: " + (string.IsNullOrWhiteSpace(snap.LastMatchImage) ? "—" : snap.LastMatchImage);
-        _oldDiagScore.Text = "Điểm sai khác / score: " + (snap.LastMatchScore is null ? "—" : snap.LastMatchScore.Value.ToString("F4"));
+        SetTextIfChanged(_oldDiagSummary, $"Số ảnh Live cũ active: {snap.ActiveCount}");
+        SetTextIfChanged(_oldDiagCapturedAt, "Lần lưu Live cũ gần nhất: " + FormatDateTime(snap.LastCapturedAt));
+        SetTextIfChanged(_oldDiagMatchAt, "Lần match gần nhất: " + FormatDateTime(snap.LastMatchAt));
+        SetTextIfChanged(_oldDiagMatch, "Kết quả match gần nhất: " + (snap.LastMatchFound is null ? "—" : snap.LastMatchFound.Value ? "KHỚP" : "KHÔNG KHỚP"));
+        SetTextIfChanged(_oldDiagMatchImage, "Ảnh match gần nhất: " + (string.IsNullOrWhiteSpace(snap.LastMatchImage) ? "—" : snap.LastMatchImage));
+        SetTextIfChanged(_oldDiagScore, "Điểm sai khác / score: " + (snap.LastMatchScore is null ? "—" : snap.LastMatchScore.Value.ToString("F4")));
 
-        _oldLiveGrid.Rows.Clear();
-        foreach (var entry in snap.Entries)
-            _oldLiveGrid.Rows.Add(entry.FileName, FormatDuration(entry.Age), FormatDuration(entry.Remaining));
+        // The entry list changes rarely, while Age/Remaining change every second.
+        // Rebuild rows only when entry identity/order changes; otherwise update
+        // just the two time cells to avoid a full DataGridView churn each tick.
+        var ids = snap.Entries.Select(entry => entry.Id).ToArray();
+        if (!_oldLiveEntryIds.SequenceEqual(ids, StringComparer.Ordinal))
+        {
+            _oldLiveGrid.Rows.Clear();
+            foreach (var entry in snap.Entries)
+                _oldLiveGrid.Rows.Add(entry.FileName, FormatDuration(entry.Age), FormatDuration(entry.Remaining));
+            _oldLiveEntryIds = ids;
+            return;
+        }
+
+        for (var i = 0; i < snap.Entries.Count && i < _oldLiveGrid.Rows.Count; i++)
+        {
+            var entry = snap.Entries[i];
+            SetCellValueIfChanged(_oldLiveGrid.Rows[i].Cells["Age"], FormatDuration(entry.Age));
+            SetCellValueIfChanged(_oldLiveGrid.Rows[i].Cells["Remaining"], FormatDuration(entry.Remaining));
+        }
+    }
+
+    static void SetTextIfChanged(Label label, string text)
+    {
+        if (!string.Equals(label.Text, text, StringComparison.Ordinal)) label.Text = text;
+    }
+
+    static void SetCellValueIfChanged(DataGridViewCell cell, string value)
+    {
+        if (!string.Equals(Convert.ToString(cell.Value), value, StringComparison.Ordinal)) cell.Value = value;
     }
 
     static string FormatDateTime(DateTime? value) => value?.ToString("HH:mm:ss") ?? "—";
@@ -2047,7 +2230,10 @@ public sealed partial class MainForm : Form
         try { SaveFromUi(); } catch (Exception ex) { _log.Warn("[SHUTDOWN] lưu cấu hình thất bại: " + ex.Message); }
 
         _periodicUiTimer.Stop();
+        _logUiTimer.Stop();
+        FlushPendingLogLines();
         try { _periodicUiTimer.Dispose(); } catch { }
+        try { _logUiTimer.Dispose(); } catch { }
         try
         {
             if (!_managedMode)

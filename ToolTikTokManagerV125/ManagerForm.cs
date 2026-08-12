@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
@@ -101,6 +101,7 @@ public sealed class ManagerForm : Form
     static readonly Color InactiveTabColor = Color.FromArgb(238, 242, 247);
     static readonly TimeSpan ChromeCloseTimeout = TimeSpan.FromSeconds(30);
     static readonly NaturalProfileNameComparer NaturalProfileNameOrder = new();
+    static readonly JsonSerializerOptions WorkerSnapshotJson = new() { PropertyNameCaseInsensitive = true };
     bool _changingTabs;
     bool _refreshing;
     bool _closing;
@@ -186,7 +187,8 @@ public sealed class ManagerForm : Form
         var catalog = _profileService.Load();
         foreach (var warning in _profileService.LastLoadWarnings)
             _log.Warn(warning);
-        _profileService.EnsurePorts(catalog.Profiles);
+        // Load() already normalizes/allocates ports and SaveWithBackup() also
+        // validates them before persistence.  Avoid a third identical pass.
         _profileService.SaveWithBackup(catalog);
         RefreshContextsFromCatalog(catalog);
     }
@@ -624,7 +626,7 @@ public sealed class ManagerForm : Form
     async Task<WorkerSnapshot> ReadStatusAsync(ProfileContext ctx)
     {
         var raw = await SendCommandAsync(ctx, "status", TimeSpan.FromSeconds(2));
-        var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new WorkerSnapshot();
+        var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, WorkerSnapshotJson) ?? new WorkerSnapshot();
         if (!snapshot.Profile.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase) || snapshot.CdpPort != ctx.Profile.CdpPort)
             throw new InvalidOperationException($"[WORKER_PROFILE_MISMATCH] Expected profile={ctx.Profile.Name}, CDP={ctx.Profile.CdpPort}; worker reported profile={snapshot.Profile}, CDP={snapshot.CdpPort}.");
         return snapshot;
@@ -635,8 +637,31 @@ public sealed class ManagerForm : Form
         await ctx.CommandGate.WaitAsync();
         try
         {
+            var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(15);
+
+            // Status is polled every second for every open profile.  A healthy
+            // worker does not need a separate ping pipe before the status pipe.
+            // Send status directly; only on failure do the old health/restart
+            // path and one idempotent retry.  Non-idempotent commands retain
+            // the original ping-before-send behavior.
+            if (command.Equals("status", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ctx.Worker is null || ctx.Worker.HasExited)
+                    await EnsureWorkerAsync(ctx);
+
+                try
+                {
+                    return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
+                }
+                catch when (!_closing)
+                {
+                    await EnsureWorkerAsync(ctx);
+                    return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
+                }
+            }
+
             await EnsureWorkerAsyncIfCommandNeedsIt(ctx, command);
-            return await SendPipeAsync(ctx.Profile.Name, command, timeout ?? TimeSpan.FromSeconds(15));
+            return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
         }
         finally { ctx.CommandGate.Release(); }
     }
@@ -706,11 +731,12 @@ public sealed class ManagerForm : Form
 
     async Task CloseProfileAsync(ProfileContext ctx)
     {
-        if (ctx.Worker is not null && !ctx.Worker.HasExited)
+        var worker = ctx.Worker;
+        if (worker is not null && !worker.HasExited)
         {
             if (MessageBox.Show($"Đóng worker V11.5 của '{ctx.Profile.Name}'?\nChrome/profile đăng nhập không bị xóa.", "Đóng profile", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
             try { await SendPipeAsync(ctx.Profile.Name, "shutdown", TimeSpan.FromSeconds(5)); } catch { }
-            try { if (!ctx.Worker.WaitForExit(7000)) ctx.Worker.Kill(true); } catch { }
+            try { if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7))) worker.Kill(true); } catch { }
         }
         RemoveTab(ctx);
     }
@@ -748,8 +774,9 @@ public sealed class ManagerForm : Form
         Enabled = false;
         foreach (var ctx in _contexts.Values.Where(c => c.Worker is not null && !c.Worker.HasExited).ToList())
         {
+            var worker = ctx.Worker;
             try { await SendPipeAsync(ctx.Profile.Name, "shutdown", TimeSpan.FromSeconds(5)); } catch { }
-            try { if (ctx.Worker is not null && !ctx.Worker.WaitForExit(7000)) ctx.Worker.Kill(true); } catch { }
+            try { if (worker is not null && !await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7))) worker.Kill(true); } catch { }
         }
         FormClosing -= OnClosing;
         Close();
@@ -812,6 +839,7 @@ public sealed class ManagerForm : Form
             AutoScaleMode = AutoScaleMode.Dpi,
             Font = new Font("Segoe UI", 10F)
         };
+        ModernDialog.Apply(form);
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -832,6 +860,7 @@ public sealed class ManagerForm : Form
             Font = new Font("Segoe UI", 10F, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 8)
         };
+        ModernDialog.StylePrimaryLabel(label);
         var nameBox = new TextBox
         {
             Dock = DockStyle.Top,
@@ -839,6 +868,7 @@ public sealed class ManagerForm : Form
             MinimumSize = new Size(0, 36),
             Margin = new Padding(0)
         };
+        ModernDialog.StyleTextInput(nameBox);
         var create = new Button
         {
             Text = "Tạo profile",
@@ -860,6 +890,8 @@ public sealed class ManagerForm : Form
             FlatStyle = FlatStyle.Flat
         };
         cancel.FlatAppearance.BorderColor = Color.FromArgb(190, 201, 214);
+        ModernDialog.StylePrimaryButton(create);
+        ModernDialog.StyleSecondaryButton(cancel);
         var buttons = new FlowLayoutPanel
         {
             AutoSize = true,
@@ -1292,6 +1324,7 @@ public sealed class ManagerForm : Form
             AutoScaleMode = AutoScaleMode.Dpi,
             Font = new Font("Segoe UI", 10F)
         };
+        ModernDialog.Apply(dialog);
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -1312,6 +1345,7 @@ public sealed class ManagerForm : Form
             Font = new Font("Segoe UI", 10F, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 5)
         };
+        ModernDialog.StylePrimaryLabel(title);
         var note = new Label
         {
             Dock = DockStyle.Top,
@@ -1328,6 +1362,7 @@ public sealed class ManagerForm : Form
             Font = new Font("Segoe UI", 11F),
             Margin = new Padding(0, 0, 0, 10)
         };
+        ModernDialog.StyleTextInput(search);
         var list = new CheckedListBox
         {
             Dock = DockStyle.Fill,
@@ -1339,6 +1374,7 @@ public sealed class ManagerForm : Form
             BorderStyle = BorderStyle.FixedSingle,
             Margin = new Padding(0)
         };
+        ModernDialog.StyleSelectionList(list);
         var selectAll = new Button
         {
             Text = "Chọn tất cả",
@@ -1380,6 +1416,10 @@ public sealed class ManagerForm : Form
             FlatStyle = FlatStyle.Flat
         };
         cancel.FlatAppearance.BorderColor = Color.FromArgb(190, 201, 214);
+        ModernDialog.StyleSecondaryButton(selectAll);
+        ModernDialog.StyleSecondaryButton(clear);
+        ModernDialog.StylePrimaryButton(sync);
+        ModernDialog.StyleSecondaryButton(cancel);
         var checkedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var rebuildingList = false;
 
@@ -1501,6 +1541,7 @@ public sealed class ManagerForm : Form
         root.Controls.Add(list, 0, 3);
         root.Controls.Add(buttons, 0, 4);
         dialog.Controls.Add(root);
+        dialog.AcceptButton = sync;
         dialog.CancelButton = cancel;
         dialog.Shown += (_, _) => search.Focus();
         ApplyFilter();
@@ -1536,7 +1577,7 @@ public sealed class ManagerForm : Form
                 try
                 {
                     var raw = await SendPipeAsync(context.Profile.Name, "status", TimeSpan.FromSeconds(2));
-                    var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, WorkerSnapshotJson);
                     automationWasRunning = snapshot?.RunState == "RUNNING";
                 }
                 catch { }
@@ -1642,6 +1683,7 @@ public sealed class ManagerForm : Form
             MaximizeBox = false,
             FormBorderStyle = FormBorderStyle.SizableToolWindow
         };
+        ModernDialog.Apply(dialog, fixedDialog: false);
         var instruction = new Label
         {
             Dock = DockStyle.Top,
@@ -1650,6 +1692,7 @@ public sealed class ManagerForm : Form
             Text = "Chọn một hoặc nhiều profile. Chỉ các profile được tích mới bị dừng Worker/Chrome, xóa dữ liệu và xóa khỏi Manager.",
             AutoEllipsis = true
         };
+        ModernDialog.StylePrimaryLabel(instruction);
         var list = new CheckedListBox
         {
             Dock = DockStyle.Fill,
@@ -1657,12 +1700,17 @@ public sealed class ManagerForm : Form
             HorizontalScrollbar = true,
             IntegralHeight = false
         };
+        ModernDialog.StyleSelectionList(list);
         list.Items.AddRange(candidates.Cast<object>().ToArray());
 
         var selectAll = new Button { Text = "Chọn tất cả", AutoSize = true };
         var clear = new Button { Text = "Bỏ chọn", AutoSize = true };
         var delete = new Button { Text = "Xóa", AutoSize = true, DialogResult = DialogResult.None };
         var cancel = new Button { Text = "Hủy", AutoSize = true, DialogResult = DialogResult.Cancel };
+        ModernDialog.StyleSecondaryButton(selectAll);
+        ModernDialog.StyleSecondaryButton(clear);
+        ModernDialog.StyleDestructiveButton(delete);
+        ModernDialog.StyleSecondaryButton(cancel);
         selectAll.Click += (_, _) => { for (var i = 0; i < list.Items.Count; i++) list.SetItemChecked(i, true); };
         clear.Click += (_, _) => { for (var i = 0; i < list.Items.Count; i++) list.SetItemChecked(i, false); };
         delete.Click += async (_, _) =>
@@ -1694,9 +1742,10 @@ public sealed class ManagerForm : Form
             }
         };
 
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 52, Padding = new Padding(10), FlowDirection = FlowDirection.RightToLeft };
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 58, Padding = new Padding(10, 8, 10, 8), FlowDirection = FlowDirection.RightToLeft };
         buttons.Controls.Add(cancel); buttons.Controls.Add(delete); buttons.Controls.Add(clear); buttons.Controls.Add(selectAll);
         dialog.Controls.Add(list); dialog.Controls.Add(instruction); dialog.Controls.Add(buttons);
+        dialog.AcceptButton = delete;
         dialog.CancelButton = cancel;
         dialog.ShowDialog(this);
     }
@@ -1940,6 +1989,7 @@ public sealed class ManagerForm : Form
             MaximizeBox = false,
             Font = new Font("Segoe UI", 10F)
         };
+        ModernDialog.Apply(form);
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(14) };
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -1948,6 +1998,8 @@ public sealed class ManagerForm : Form
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         var label = new Label { Text = "Chọn profile cần mở", AutoSize = true, Font = new Font("Segoe UI", 10F, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) };
         var search = new TextBox { Dock = DockStyle.Top, PlaceholderText = "Tìm profile...", Font = new Font("Segoe UI", 11F), Margin = new Padding(0, 0, 0, 10) };
+        ModernDialog.StylePrimaryLabel(label);
+        ModernDialog.StyleTextInput(search);
         var multiSelect = new CheckBox
         {
             Text = "Chọn nhiều profile",
@@ -1979,12 +2031,16 @@ public sealed class ManagerForm : Form
             Margin = new Padding(0),
             Visible = false
         };
+        ModernDialog.StyleSelectionList(singleList);
+        ModernDialog.StyleSelectionList(multiList);
         listHost.Controls.Add(multiList);
         listHost.Controls.Add(singleList);
 
         var open = new Button { Text = "Mở profile", Size = new Size(132, 42), Font = new Font("Segoe UI", 10F, FontStyle.Bold), BackColor = Color.FromArgb(232, 242, 255), ForeColor = Color.FromArgb(35, 91, 152), FlatStyle = FlatStyle.Flat };
         open.FlatAppearance.BorderColor = Color.FromArgb(130, 173, 220);
         var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 42), Font = new Font("Segoe UI", 10F), FlatStyle = FlatStyle.Flat };
+        ModernDialog.StylePrimaryButton(open);
+        ModernDialog.StyleSecondaryButton(cancel);
         var flow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 10, 0, 0) };
         flow.Controls.Add(cancel);
         flow.Controls.Add(open);
@@ -2163,12 +2219,18 @@ public sealed class ManagerForm : Form
     string? PromptText(string title, string label, string initial = "")
     {
         using var form = new Form { Text = title, Width = 440, Height = 180, StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false };
+        ModernDialog.Apply(form);
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
         var text = new TextBox { Text = initial, Dock = DockStyle.Top };
         var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
         var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true };
         var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, AutoSize = true };
         flow.Controls.Add(cancel); flow.Controls.Add(ok); root.Controls.Add(new Label { Text = label, AutoSize = true }, 0, 0); root.Controls.Add(text, 0, 1); root.Controls.Add(flow, 0, 2); form.Controls.Add(root); form.AcceptButton = ok; form.CancelButton = cancel;
+        ModernDialog.StylePrimaryLabel(root.Controls.OfType<Label>().First());
+        ModernDialog.StyleTextInput(text);
+        ModernDialog.StylePrimaryButton(ok);
+        ModernDialog.StyleSecondaryButton(cancel);
+        form.Shown += (_, _) => { text.Focus(); text.SelectAll(); };
         return form.ShowDialog(this) == DialogResult.OK ? text.Text.Trim() : null;
     }
 

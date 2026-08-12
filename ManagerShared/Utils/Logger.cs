@@ -3,14 +3,20 @@ using System.Collections.Concurrent;
 
 namespace ToolTikTokV12.Utils;
 
-public sealed class Logger
+public sealed class Logger : IDisposable
 {
     const long MaxActiveLogBytes = 64L * 1024 * 1024;
+    static readonly TimeSpan BufferedFlushInterval = TimeSpan.FromMilliseconds(200);
     static readonly ConcurrentDictionary<string, System.Threading.Timer> CleanupTimers = new(StringComparer.OrdinalIgnoreCase);
     readonly string _dir;
     readonly string _logRoot;
     readonly string? _fixedFileName;
     readonly object _lock = new();
+    readonly System.Threading.Timer _flushTimer;
+    StreamWriter? _writer;
+    FileStream? _writerStream;
+    string _activePath = "";
+    bool _disposed;
     public event Action<string>? LineWritten;
 
     public Logger(string baseDir, string? scope = null, string? fixedFileName = null)
@@ -20,6 +26,12 @@ public sealed class Logger
         _fixedFileName = fixedFileName;
         Directory.CreateDirectory(_dir);
         ScheduleLogCleanup();
+
+        // Reuse one append stream instead of opening, flushing and closing a
+        // file for every Manager status/IPC line.  The 200 ms flush window keeps
+        // the file current while removing avoidable synchronous I/O from UI/IPC.
+        _flushTimer = new System.Threading.Timer(_ => FlushBuffered(), null, BufferedFlushInterval, BufferedFlushInterval);
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Dispose();
     }
 
     public void Info(string text) => Write("INFO", text);
@@ -28,33 +40,76 @@ public sealed class Logger
 
     public void Write(string level, string text)
     {
-        var line = $"[{DateTime.Now:HH:mm:ss}] [{level}] {text}";
+        var now = DateTime.Now;
+        var line = $"[{now:HH:mm:ss}] [{level}] {text}";
         lock (_lock)
         {
-            var fileName = string.IsNullOrWhiteSpace(_fixedFileName) ? $"{DateTime.Now:yyyy-MM-dd}.log" : _fixedFileName;
+            ThrowIfDisposed();
+            var fileName = string.IsNullOrWhiteSpace(_fixedFileName) ? $"{now:yyyy-MM-dd}.log" : _fixedFileName;
             var path = Path.Combine(_dir, fileName);
+            EnsureWriter(path);
             RotateIfNeeded(path);
-            using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-            using var writer = new StreamWriter(stream, new UTF8Encoding(true));
-            writer.WriteLine(line);
-            writer.Flush();
+            EnsureWriter(path);
+            _writer!.WriteLine(line);
+            if (level.Equals("ERROR", StringComparison.OrdinalIgnoreCase))
+                _writer.Flush();
         }
         LineWritten?.Invoke(line);
+    }
+
+    void EnsureWriter(string path)
+    {
+        if (_writer is not null && path.Equals(_activePath, StringComparison.OrdinalIgnoreCase)) return;
+        CloseWriterNoThrow();
+        _writerStream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, 16 * 1024, FileOptions.SequentialScan);
+        _writer = new StreamWriter(_writerStream, new UTF8Encoding(true), 16 * 1024, leaveOpen: false) { AutoFlush = false };
+        _activePath = path;
     }
 
     void RotateIfNeeded(string activePath)
     {
         try
         {
-            var info = new FileInfo(activePath);
-            if (!info.Exists || info.Length < MaxActiveLogBytes) return;
+            var length = _writerStream is not null && activePath.Equals(_activePath, StringComparison.OrdinalIgnoreCase)
+                ? _writerStream.Length
+                : new FileInfo(activePath).Length;
+            if (length < MaxActiveLogBytes) return;
+
+            if (activePath.Equals(_activePath, StringComparison.OrdinalIgnoreCase))
+                CloseWriterNoThrow();
             var directory = Path.GetDirectoryName(activePath)!;
             var baseName = Path.GetFileNameWithoutExtension(activePath);
             var archive = Path.Combine(directory, $"{baseName}-{DateTime.Now:yyyyMMdd_HHmmss}.log");
             File.Move(activePath, archive);
         }
+        catch (FileNotFoundException) { }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+    }
+
+    void FlushBuffered()
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            try { _writer?.Flush(); }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    void CloseWriterNoThrow()
+    {
+        try { _writer?.Flush(); } catch { }
+        try { _writer?.Dispose(); } catch { }
+        _writer = null;
+        _writerStream = null;
+        _activePath = "";
+    }
+
+    void ThrowIfDisposed()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(Logger));
     }
 
     void ScheduleLogCleanup()
@@ -133,5 +188,17 @@ public sealed class Logger
                 if ((subdirectory.Attributes & FileAttributes.ReparsePoint) == 0)
                     pending.Push(subdirectory.FullName);
         }
+    }
+
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { _flushTimer.Dispose(); } catch { }
+            CloseWriterNoThrow();
+        }
+        GC.SuppressFinalize(this);
     }
 }
