@@ -19,6 +19,7 @@ public sealed partial class MainForm : Form
     readonly ChromeController _chrome;
     readonly ToolTikTokV12.Services.ChromeProfileNameSyncService _chromeProfileNameSync = new();
     readonly AutomationEngine _engine;
+    readonly RuntimeStatsTracker _runtimeStats;
     AppSettings _settings;
     TikTokProfileCatalog _profileCatalog = new();
     bool _loadingProfiles;
@@ -40,6 +41,9 @@ public sealed partial class MainForm : Form
     readonly Label _runState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Trạng thái: Sẵn sàng", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _runDetail = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Bước: —", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _roundState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Vòng: 0", TextAlign = ContentAlignment.MiddleLeft };
+    readonly Label _sessionRuntimeState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "⏱ Phiên hiện tại: 00:00:00", TextAlign = ContentAlignment.MiddleLeft };
+    readonly Label _todayRuntimeState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Hôm nay: 00:00:00", TextAlign = ContentAlignment.MiddleLeft };
+    readonly Label _totalRuntimeState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "Tổng thời gian chạy: 0h 00m", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _periodicState = new() { AutoSize = false, Dock = DockStyle.Fill, Text = "↓ + F5 định kỳ: chưa chạy.", TextAlign = ContentAlignment.MiddleLeft };
     readonly Label _lastError = new() { AutoSize = false, Dock = DockStyle.Fill, ForeColor = Color.Firebrick, Text = "Lỗi: không có", TextAlign = ContentAlignment.MiddleLeft };
     readonly DataGridView _regions = new() { Dock = DockStyle.Fill, AllowUserToAddRows = false, AllowUserToDeleteRows = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None };
@@ -124,7 +128,7 @@ public sealed partial class MainForm : Form
         var settingsSw = System.Diagnostics.Stopwatch.StartNew();
         _settings = _settingsService.Load();
         settingsSw.Stop();
-        _chrome = new ChromeController(_log); _engine = new AutomationEngine(_baseDir, _chrome, _log);
+        _chrome = new ChromeController(_log); _engine = new AutomationEngine(_baseDir, _chrome, _log); _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
         var profileSw = System.Diagnostics.Stopwatch.StartNew();
         if (_managedMode)
         {
@@ -170,7 +174,8 @@ public sealed partial class MainForm : Form
             _profileCombo.Enabled = false;
             _toolTip.SetToolTip(_profileCombo, "Profile này được Manager V12.5 khóa cố định cho worker hiện tại.");
         }
-        _log.LineWritten += OnLog; _engine.Status += OnEngineStatus; _engine.Problem += OnEngineProblem; _engine.StateChanged += OnEngineState;
+        _log.LineWritten += OnLog; _engine.Status += OnEngineStatus; _engine.Problem += OnEngineProblem; _engine.RunStateChanged += OnEngineRunStateChanged; _engine.StateChanged += OnEngineState;
+        Application.ApplicationExit += OnApplicationExit;
         _periodicUiTimer.Tick += (_, _) => RefreshUiStatusLabels();
         _logUiTimer.Tick += (_, _) => FlushPendingLogLines();
         Shown += (_, _) =>
@@ -203,7 +208,7 @@ public sealed partial class MainForm : Form
         tabs.TabPages.Add(BuildGeneralTab()); tabs.TabPages.Add(BuildRegionsTab()); tabs.TabPages.Add(BuildViewerTab()); tabs.TabPages.Add(BuildOldLiveTab()); tabs.TabPages.Add(BuildDiagnosticsTab()); tabs.TabPages.Add(BuildLogTab());
         Controls.Add(tabs);
         // Khu vực chạy được tách nhiều dòng để không kéo dài giao diện theo chiều ngang.
-        var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 156, ColumnCount = 2, RowCount = 1, Padding = new Padding(6) };
+        var bottom = new TableLayoutPanel { Dock = DockStyle.Bottom, Height = 224, ColumnCount = 2, RowCount = 1, Padding = new Padding(6) };
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 390));
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
@@ -215,17 +220,16 @@ public sealed partial class MainForm : Form
         var import = Btn("Nhập", (_, _) => ImportConfig());
         actions.Controls.AddRange([_runStopButton, _pauseResumeButton, save, export, import]);
 
-        var status = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Margin = new Padding(10, 0, 0, 0) };
-        status.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        status.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        status.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        status.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
-        status.RowStyles.Add(new RowStyle(SizeType.Percent, 20));
+        var status = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 8, Margin = new Padding(10, 0, 0, 0) };
+        for (var row = 0; row < 8; row++) status.RowStyles.Add(new RowStyle(SizeType.Percent, 12.5F));
         status.Controls.Add(_runState, 0, 0);
         status.Controls.Add(_runDetail, 0, 1);
         status.Controls.Add(_roundState, 0, 2);
-        status.Controls.Add(_periodicState, 0, 3);
-        status.Controls.Add(_lastError, 0, 4);
+        status.Controls.Add(_sessionRuntimeState, 0, 3);
+        status.Controls.Add(_todayRuntimeState, 0, 4);
+        status.Controls.Add(_totalRuntimeState, 0, 5);
+        status.Controls.Add(_periodicState, 0, 6);
+        status.Controls.Add(_lastError, 0, 7);
         bottom.Controls.Add(actions, 0, 0);
         bottom.Controls.Add(status, 1, 0);
         Controls.Add(bottom);
@@ -306,6 +310,9 @@ public sealed partial class MainForm : Form
         _runState.ForeColor = Color.FromArgb(32, 98, 55);
         _runDetail.ForeColor = Color.FromArgb(34, 93, 168);
         _roundState.ForeColor = Color.FromArgb(78, 78, 78);
+        _sessionRuntimeState.ForeColor = Color.FromArgb(28, 101, 153);
+        _todayRuntimeState.ForeColor = Color.FromArgb(47, 96, 72);
+        _totalRuntimeState.ForeColor = Color.FromArgb(77, 80, 91);
         UpdateRunControlButtons();
         _periodicState.ForeColor = Color.FromArgb(86, 76, 170);
         _lastError.ForeColor = Color.FromArgb(88, 88, 88);
@@ -317,9 +324,18 @@ public sealed partial class MainForm : Form
     void RefreshUiStatusLabels()
     {
         UpdateRunControlButtons();
+        RefreshRuntimeStatsLabels();
         RefreshPeriodicCountdownLabel();
         RefreshChromeStatus();
         RefreshOldLiveDiagnostics();
+    }
+
+    void RefreshRuntimeStatsLabels()
+    {
+        var snapshot = _runtimeStats.GetSnapshot();
+        SetTextIfChanged(_sessionRuntimeState, "⏱ Phiên hiện tại: " + FormatRuntimeClock(snapshot.Session));
+        SetTextIfChanged(_todayRuntimeState, "Hôm nay: " + FormatRuntimeClock(snapshot.Today));
+        SetTextIfChanged(_totalRuntimeState, "Tổng thời gian chạy: " + FormatRuntimeTotal(snapshot.Total));
     }
 
     void ConfigureRunControlButton(Button button, EventHandler click)
@@ -2121,6 +2137,22 @@ public sealed partial class MainForm : Form
         RefreshUiStatusLabels();
     }
 
+    void OnEngineRunStateChanged(AutomationRunState state)
+    {
+        // This event is raised by AutomationEngine immediately after its actual
+        // running/paused flags change; it is not inferred from the UI text.
+        _runtimeStats.ApplyEngineState(state);
+    }
+
+    void OnApplicationExit(object? sender, EventArgs e)
+    {
+        // Covers normal process teardown paths that bypass a visible FormClosing
+        // interaction. A forced OS termination can still lose only the interval
+        // after the most recent 30-second checkpoint.
+        _runtimeStats.Flush();
+        _runtimeStats.Dispose();
+    }
+
     void RefreshPeriodicCountdownLabel()
     {
         string text;
@@ -2200,6 +2232,18 @@ public sealed partial class MainForm : Form
         return $"{(int)value.TotalMinutes:00}:{value.Seconds:00}";
     }
 
+    static string FormatRuntimeClock(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero) value = TimeSpan.Zero;
+        return $"{(long)value.TotalHours:00}:{value.Minutes:00}:{value.Seconds:00}";
+    }
+
+    static string FormatRuntimeTotal(TimeSpan value)
+    {
+        if (value < TimeSpan.Zero) value = TimeSpan.Zero;
+        return $"{(long)value.TotalHours}h {value.Minutes:00}m";
+    }
+
     void RegisterGlobalHotkeys()
     {
         RegisterHotKey(Handle, HOTKEY_START, 0, (uint)Keys.F8); RegisterHotKey(Handle, HOTKEY_PAUSE, 0, (uint)Keys.F9); RegisterHotKey(Handle, HOTKEY_STOP, 0, (uint)Keys.Escape);
@@ -2258,6 +2302,8 @@ public sealed partial class MainForm : Form
         }
         if (engineStopped) _log.Warn("[SHUTDOWN] AutomationEngine đã dừng");
         else _log.Warn("[SHUTDOWN] timeout AutomationEngine");
+        _runtimeStats.Flush();
+        _runtimeStats.Dispose();
 
         _log.Warn("[SHUTDOWN] disconnect CDP");
         try

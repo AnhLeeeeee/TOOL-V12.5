@@ -6,6 +6,8 @@ using ToolTikTokV11.Utils;
 
 namespace ToolTikTokV11.Services;
 
+public enum AutomationRunState { Stopped, Running, Paused }
+
 /// <summary>
 /// V11 chỉ thay lớp tương tác Chrome bằng XPath/CDP. State machine và thứ tự ưu tiên
 /// dưới đây bám theo V10.4.4, với một thay đổi chủ đích ở V12.5: quét ảnh thường
@@ -149,11 +151,13 @@ public sealed class AutomationEngine
 
     public bool Running => _running;
     public bool Paused => _paused;
+    public AutomationRunState RunState => !_running ? AutomationRunState.Stopped : _paused ? AutomationRunState.Paused : AutomationRunState.Running;
     public long Rounds => _rounds;
     public Task CompletionTask => _task ?? Task.CompletedTask;
     public event Action<string>? Status;
     public event Action<string>? Problem;
     public event Action? StateChanged;
+    public event Action<AutomationRunState>? RunStateChanged;
 
     public AutomationEngine(string baseDir, ChromeController chrome, Logger log)
     {
@@ -233,7 +237,7 @@ public sealed class AutomationEngine
         _task = Task.Run(() => LoopAsync(_cts.Token));
         _log.Info("V11 bắt đầu. Logic xử lý theo V10.4.4; lớp click/phím/F5 dùng XPath + Chrome DevTools.");
         SetStatus("ĐANG CHẠY", "V11 XPath/CDP đã bắt đầu.");
-        StateChanged?.Invoke();
+        NotifyStateChanged();
     }
 
     public void TogglePause()
@@ -243,7 +247,7 @@ public sealed class AutomationEngine
         _log.Info(_paused ? "Tool đã tạm dừng." : "Tool tiếp tục.");
         SetStatus(_paused ? "TẠM DỪNG" : "ĐANG CHẠY", _paused ? "F9 để tiếp tục." : "Đã tiếp tục.");
         SyncPeriodicSnapshot();
-        StateChanged?.Invoke();
+        NotifyStateChanged();
     }
 
     void AutoPause(string reason)
@@ -254,7 +258,7 @@ public sealed class AutomationEngine
         _log.Error("[AUTO_PAUSE] " + reason);
         SetStatus("TẠM DỪNG DO LỖI LIÊN TIẾP", reason);
         SyncPeriodicSnapshot();
-        StateChanged?.Invoke();
+        NotifyStateChanged();
     }
 
     public void Stop(string reason = "Người dùng dừng tool")
@@ -267,7 +271,7 @@ public sealed class AutomationEngine
         SetStatus("ĐÃ DỪNG", reason);
         try { _cts?.Cancel(); } catch { }
         SyncPeriodicSnapshot();
-        StateChanged?.Invoke();
+        NotifyStateChanged();
     }
 
     public async Task<bool> WaitForStopAsync(TimeSpan timeout)
@@ -328,8 +332,14 @@ public sealed class AutomationEngine
             _running = false;
             _periodicExecuting = false;
             SyncPeriodicSnapshot();
-            StateChanged?.Invoke();
+            NotifyStateChanged();
         }
+    }
+
+    void NotifyStateChanged()
+    {
+        RunStateChanged?.Invoke(RunState);
+        StateChanged?.Invoke();
     }
 
     async Task WaitIfPausedAsync(CancellationToken ct)
@@ -695,7 +705,7 @@ public sealed class AutomationEngine
                     _contentIndex = (_contentIndex + 1) % _contents.Count;
                     _step = 1;
                     SetStatus("ĐANG CHẠY", $"Hoàn tất vòng {_rounds} với nội dung {used}/{_contents.Count}. Tiếp theo {_contentIndex + 1}/{_contents.Count}.");
-                    StateChanged?.Invoke();
+                    NotifyStateChanged();
                     await Task.Delay(NormalLoopDelay(), ct);
                     if (_loopPerf is not null)
                     {

@@ -7,7 +7,7 @@ namespace ToolTikTokV12.Services;
 
 public sealed class TikTokProfileService
 {
-    public static string ProfilesRoot => Path.Combine(AppContext.BaseDirectory, "TikTokProfiles");
+    public const string ProfilesRoot = @"D:\TOOL V2\TikTokProfiles";
     public const string LegacyImportedProfilePath = @"D:\TOOL V2\Tool_TikTok_V11_XPath_CSharp\dist\chrome_v11_profile";
     public const string LegacyImportedProfileName = "TikTok cu";
     const int DefaultStartPort = 9222;
